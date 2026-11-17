@@ -5,7 +5,7 @@ from datetime import datetime
 
 # 페이지 설정
 st.set_page_config(
-    page_title="통합 퀀텀 복권 제너레이터 Pro",
+    page_title="종합 퀀텀 복권 연구소 Pro",
     page_icon="✨",
     layout="centered"
 )
@@ -35,6 +35,22 @@ st.markdown("""
     .ball-3 { background-color: #e11d48; }
     .ball-4 { background-color: #475569; }
     .ball-5 { background-color: #10b981; }
+    
+    .power-ball {
+        display: inline-flex;
+        width: 38px;
+        height: 38px;
+        border-radius: 50%;
+        align-items: center;
+        justify-content: center;
+        font-weight: bold;
+        color: white;
+        background: linear-gradient(135deg, #ec4899, #8b5cf6);
+        margin-left: 8px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        font-size: 14px;
+        border: 2px solid #f472b6;
+    }
     
     .pension-group-badge {
         display: inline-flex;
@@ -80,10 +96,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 def get_ball_class(num):
-    if num <= 10: return "ball-1"
-    if num <= 20: return "ball-2"
-    if num <= 30: return "ball-3"
-    if num <= 40: return "ball-4"
+    if num <= 6: return "ball-1"
+    if num <= 12: return "ball-2"
+    if num <= 18: return "ball-3"
+    if num <= 24: return "ball-4"
     return "ball-5"
 
 # ==========================================
@@ -184,56 +200,72 @@ def generate_lotto_game(history, mode, fixed_nums, exclude_nums):
     return {"numbers": nums, "grade": grade, "ac": calculate_ac(nums)}
 
 # ==========================================
-# 연금복권 720+ 실제 통계·확률 기반 엔진
+# 연금복권 720+ 통계 기반 엔진
 # ==========================================
 @st.cache_data(ttl=3600)
 def fetch_pension_statistics():
-    base_weights = {
-        pos: {digit: random.uniform(8.0, 15.0) for digit in range(10)} 
-        for pos in range(6)
-    }
-    return base_weights
+    return {pos: {digit: random.uniform(8.0, 15.0) for digit in range(10)} for pos in range(6)}
 
 def generate_pension_game(pension_version, pension_mode):
     stats_weights = fetch_pension_statistics()
-    
     if "기존 방식" in pension_version:
         group = random.randint(1, 5)
-        digits = []
-        for pos in range(6):
-            w = list(stats_weights[pos].values())
-            chosen = random.choices(range(10), weights=w, k=1)[0]
-            digits.append(chosen)
-            
+        digits = [random.choices(range(10), weights=list(stats_weights[pos].values()), k=1)[0] for pos in range(6)]
         digit_sum = sum(digits)
         score = (digit_sum * digits[-1] + group) % 100
         p_grade = "S급 (단일조 통계 퀀텀)" if score > 75 else ("A급 (스마트 밸런스)" if score > 40 else "B급 패턴")
         return {"type": "single", "group": group, "digits": digits, "grade": p_grade, "sum": digit_sum}
     else:
-        max_attempts = 2000
-        for _ in range(max_attempts):
+        for _ in range(2000):
             digits = []
             for pos in range(6):
                 w = list(stats_weights[pos].values())
                 if pension_mode == "🔥 연금 핫패턴형":
                     max_idx = max(range(len(w)), key=w.__getitem__)
                     w[max_idx] += 10.0
-                
-                chosen = random.choices(range(10), weights=w, k=1)[0]
-                digits.append(chosen)
-                
+                digits.append(random.choices(range(10), weights=w, k=1)[0])
             digit_sum = sum(digits)
             if 18 <= digit_sum <= 36:
-                has_triple = any(digits[i] == digits[i+1] == digits[i+2] for i in range(4))
-                if not has_triple:
+                if not any(digits[i] == digits[i+1] == digits[i+2] for i in range(4)):
                     break
         else:
             digits = [random.randint(0, 9) for _ in range(6)]
-            
         digit_sum = sum(digits)
         score = (digit_sum * digits[-1]) % 100
         p_grade = "S급 (연금 하이퍼 통계 조합)" if score > 75 else ("A급 (스마트 밸런스 조합)" if score > 40 else "B급 패턴")
         return {"type": "fullset", "digits": digits, "grade": p_grade, "sum": digit_sum}
+
+# ==========================================
+# 파워볼 (1~28 중 5개 + 파워볼 0~9 중 1개) 통계 엔진
+# ==========================================
+def generate_powerball_game(power_mode):
+    # 일반볼 1~28 중 5개 선택 (통계적 합산 및 홀짝 필터 적용)
+    weights = {i: random.uniform(8.0, 15.0) for i in range(1, 29)}
+    if power_mode == "🔥 파워볼 핫패턴형":
+        for i in [3, 7, 14, 21, 25]: weights[i] += 10.0
+        
+    for _ in range(1500):
+        picked = random.choices(list(weights.keys()), weights=list(weights.values()), k=5)
+        if len(set(picked)) != 5: continue
+        nums = sorted(picked)
+        total_sum = sum(nums)
+        odds = sum(1 for n in nums if n % 2 != 0)
+        # 일반볼 총합 범위 (50 ~ 95 사이가 통계적으로 가장 유리)
+        if 50 <= total_sum <= 95 and 2 <= odds <= 3:
+            break
+    else:
+        nums = sorted(random.sample(range(1, 29), 5))
+        
+    # 파워볼 0~9 중 1개 선택 (가중치 적용)
+    power_weights = [10.0] * 10
+    if power_mode == "🔥 파워볼 핫패턴형":
+        power_weights[3] += 8.0
+        power_weights[7] += 8.0
+    power_num = random.choices(range(10), weights=power_weights, k=1)[0]
+    
+    score = (sum(nums) * power_num) % 100
+    grade = "S급 (파워볼 하이퍼 기운)" if score > 75 else ("A급 (스마트 밸런스)" if score > 40 else "B급 패턴")
+    return {"numbers": nums, "power": power_num, "grade": grade, "sum": sum(nums)}
 
 # ==========================================
 # 사이드바 메인 메뉴 설정
@@ -241,45 +273,30 @@ def generate_pension_game(pension_version, pension_mode):
 st.sidebar.markdown("### 🎲 복권 프로그램 선택")
 app_mode = st.sidebar.selectbox(
     "실행할 복권 엔진",
-    ["🎰 로또 6/45 퀀텀 Pro", "🎟️ 연금복권 720+ 퀀텀 Pro"]
+    ["🎰 로또 6/45 퀀텀 Pro", "🎟️ 연금복권 720+ 퀀텀 Pro", "⚡ 파워볼 퀀텀 Pro"]
 )
 
 st.sidebar.markdown("---")
 
 if app_mode == "🎰 로또 6/45 퀀텀 Pro":
     st.sidebar.markdown("### 🎛️ 로또 통계 전략 설정")
-    analysis_mode = st.sidebar.selectbox(
-        "분석 알고리즘 모드",
-        ["⚖️ 완벽 균형 퀀텀형", "🔥 핫넘버 집중형", "🧊 콜드넘버 역발상형"]
-    )
+    analysis_mode = st.sidebar.selectbox("분석 알고리즘 모드", ["⚖️ 완벽 균형 퀀텀형", "🔥 핫넘버 집중형", "🧊 콜드넘버 역발상형"])
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 🎯 로또 번호 커스텀")
     all_numbers = list(range(1, 46))
     fixed_nums = st.sidebar.multiselect("📌 고정수 (최대 5개)", options=all_numbers, max_selections=5)
     exclude_nums = st.sidebar.multiselect("🚫 제외수", options=all_numbers, max_selections=35)
-    
-    overlap = set(fixed_nums) & set(exclude_nums)
-    if overlap:
-        st.sidebar.warning(f"⚠️ {sorted(list(overlap))}번은 고정수 우선 적용됩니다.")
+
+elif app_mode == "🎟️ 연금복권 720+ 퀀텀 Pro":
+    st.sidebar.markdown("### 🎛️ 연금복권 통계 전략 설정")
+    pension_version = st.sidebar.selectbox("구매 전략 버전", ["🎫 단일 조 / 무작위 모드 (기존 방식)", "👑 전조(1~5조) 풀세트 최적화 모드 (개선된 방식)"])
+    pension_mode = st.sidebar.selectbox("연금 분석 모드", ["🧊 연금 균형분산형", "🔥 연금 핫패턴형"])
 
 else:
-    st.sidebar.markdown("### 🎛️ 연금복권 통계 전략 설정")
-    pension_version = st.sidebar.selectbox(
-        "구매 전략 버전 선택",
-        [
-            "🎫 단일 조 / 무작위 모드 (기존 방식)",
-            "👑 전조(1~5조) 풀세트 최적화 모드 (개선된 방식)"
-        ]
-    )
-    pension_mode = st.sidebar.selectbox(
-        "연금 분석 모드",
-        ["🧊 연금 균형분산형", "🔥 연금 핫패턴형"]
-    )
+    st.sidebar.markdown("### 🎛️ 파워볼 통계 전략 설정")
+    power_mode = st.sidebar.selectbox("파워볼 분석 모드", ["⚖️ 파워볼 균형분산형", "🔥 파워볼 핫패턴형"])
     st.sidebar.markdown("---")
-    if "기존 방식" in pension_version:
-        st.sidebar.info("💡 **기존 방식:** 역대 자리별 출현 통계를 반영한 단일 조 조합입니다.")
-    else:
-        st.sidebar.info("💡 **개선된 풀세트 방식:** 1~5조 전조 구매 전략에 맞추어, 자리별 통계 가중치와 합산 정규분포 필터를 100% 적용한 최적 번호입니다.")
+    st.sidebar.info("💡 **동행복권 파워볼:** 1~28 일반볼 5개 + 0~9 파워볼 1개의 통계적 최적 조합을 5게임 산출합니다.")
 
 # ==========================================
 # 메인 화면 출력
@@ -317,9 +334,9 @@ if app_mode == "🎰 로또 6/45 퀀텀 Pro":
             </div>
         """, unsafe_allow_html=True)
 
-else:
+elif app_mode == "🎟️ 연금복권 720+ 퀀텀 Pro":
     st.markdown(f"<h1 style='text-align: center; color: white;'>🎟️ 연금복권 720+ 통계 퀀텀 제너레이터</h1>", unsafe_allow_html=True)
-    st.markdown(f"<p style='text-align: center; color: #94a3b8; font-size: 13px;'>모드: <b style='color: #c084fc;'>{pension_version}</b> | <b style='color: #38bdf8;'>자리별 출현 통계 엔진 가동 중</b></p>", unsafe_allow_html=True)
+    st.markdown(f"<p style='text-align: center; color: #94a3b8; font-size: 13px;'>모드: <b style='color: #c084fc;'>{pension_version}</b></p>", unsafe_allow_html=True)
     st.write("")
 
     if st.button("🚀 이번 주 연금복권 5세트(A~E) 통계 최적 번호 산출하기", use_container_width=True):
@@ -330,20 +347,13 @@ else:
         for label in ['A', 'B', 'C', 'D', 'E']:
             p_game = generate_pension_game(pension_version, pension_mode)
             digits_html = "".join([f"<span class='pension-digit'>{d}</span>" for d in p_game['digits']])
-            
-            if p_game['type'] == 'single':
-                badge_html = f"<span class='pension-group-badge'>{p_game['group']}조</span>"
-            else:
-                badge_html = "<span class='pension-set-badge'>1~5조 풀세트</span>"
+            badge_html = f"<span class='pension-group-badge'>{p_game['group']}조</span>" if p_game['type'] == 'single' else "<span class='pension-set-badge'>1~5조 풀세트</span>"
             
             st.markdown(f"""
                 <div style="background-color: #1e293b; padding: 14px 18px; border-radius: 12px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; border: 1px solid #334155;">
                     <div style="display: flex; align-items: center; gap: 12px;">
                         <span style="background: rgba(99, 102, 241, 0.2); color: #818cf8; width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 13px; border: 1px solid rgba(129, 140, 248, 0.3);">{label}</span>
-                        <div>
-                            {badge_html}
-                            {digits_html}
-                        </div>
+                        <div>{badge_html}{digits_html}</div>
                     </div>
                     <div style="text-align: right;">
                         <div style="color: #c084fc; font-weight: bold; font-size: 12px;">{p_game['grade']}</div>
@@ -355,5 +365,39 @@ else:
         st.markdown("""
             <div style="background-color: #1e293b; padding: 40px; border-radius: 16px; text-align: center; border: 1px dashed #475569; color: #94a3b8;">
                 사이드바에서 버전을 선택하고 연금복권 번호 산출 버튼을 눌러보세요!
+            </div>
+        """, unsafe_allow_html=True)
+
+else:
+    st.markdown(f"<h1 style='text-align: center; color: white;'>⚡ 동행복권 파워볼 퀀텀 제너레이터</h1>", unsafe_allow_html=True)
+    st.markdown(f"<p style='text-align: center; color: #94a3b8; font-size: 13px;'>가동 엔진: <b style='color: #f472b6;'>{power_mode}</b> | 일반볼(1~28) 5개 + 파워볼(0~9) 1개</p>", unsafe_allow_html=True)
+    st.write("")
+
+    if st.button("🚀 이번 주 파워볼 5게임(A~E) 통계 최적 조합 산출하기", use_container_width=True):
+        with st.spinner("파워볼 출현 빈도 및 통계 확률 연산 중..."):
+            pass
+        st.toast("파워볼 퀀텀 모델 가동 완료 🚀", icon="ℹ️")
+        
+        for label in ['A', 'B', 'C', 'D', 'E']:
+            pb_game = generate_powerball_game(power_mode)
+            balls_html = "".join([f"<span class='ball {get_ball_class(n)}'>{n}</span>" for n in pb_game['numbers']])
+            power_html = f"<span class='power-ball'>{pb_game['power']}</span>"
+            
+            st.markdown(f"""
+                <div style="background-color: #1e293b; padding: 14px 18px; border-radius: 12px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; border: 1px solid #334155;">
+                    <div style="display: flex; align-items: center; gap: 12px;">
+                        <span style="background: rgba(99, 102, 241, 0.2); color: #818cf8; width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 13px; border: 1px solid rgba(129, 140, 248, 0.3);">{label}</span>
+                        <div style="display: flex; align-items: center; gap: 4px;">{balls_html} <span style="color: #64748b; font-weight: bold; margin: 0 4px;">+</span> {power_html}</div>
+                    </div>
+                    <div style="text-align: right;">
+                        <div style="color: #f472b6; font-weight: bold; font-size: 12px;">{pb_game['grade']}</div>
+                        <div style="color: #64748b; font-size: 10px;">일반볼 합계: {pb_game['sum']}</div>
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
+    else:
+        st.markdown("""
+            <div style="background-color: #1e293b; padding: 40px; border-radius: 16px; text-align: center; border: 1px dashed #475569; color: #94a3b8;">
+                사이드바에서 파워볼 모드를 선택하고 번호 산출 버튼을 눌러보세요!
             </div>
         """, unsafe_allow_html=True)
