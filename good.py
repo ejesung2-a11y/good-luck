@@ -17,7 +17,6 @@ st.markdown("""
         background-color: #0f172a;
         color: #f8fafc;
     }
-    /* 모바일에서 번호 공 크기 및 마진 최적화 */
     .ball {
         display: inline-flex;
         width: 34px;
@@ -55,12 +54,12 @@ st.markdown("""
     
     .pension-group-badge {
         display: inline-flex;
-        padding: 4px 8px;
+        padding: 4px 10px;
         border-radius: 6px;
         font-weight: bold;
         background: linear-gradient(135deg, #6366f1, #a855f7);
         color: white;
-        font-size: 11px;
+        font-size: 12px;
         margin-right: 6px;
         vertical-align: middle;
     }
@@ -93,8 +92,6 @@ st.markdown("""
         border: 2px solid #fde047;
         box-shadow: 0 0 6px rgba(253, 224, 71, 0.6);
     }
-    
-    /* 모바일 카드 박스 컴팩트 정렬 */
     .result-card {
         background-color: #1e293b;
         padding: 12px 14px;
@@ -215,7 +212,7 @@ def generate_lotto_game(history, mode, fixed_nums, exclude_nums, strict_level):
     return {"numbers": nums, "grade": grade, "ac": calculate_ac(nums)}
 
 # ==========================================
-# 연금복권 720+ 통계 기반 엔진
+# 연금복권 720+ 통계 기반 엔진 (단일 조 / 전조 명확 분기)
 # ==========================================
 @st.cache_data(ttl=3600)
 def fetch_pension_statistics():
@@ -223,14 +220,24 @@ def fetch_pension_statistics():
 
 def generate_pension_game(pension_version, pension_mode):
     stats_weights = fetch_pension_statistics()
-    if "기존 방식" in pension_version:
+    
+    # "단일 조" 문구가 포함되어 있으면 1~5조 생성 포함
+    if "단일 조" in pension_version:
         group = random.randint(1, 5)
-        digits = [random.choices(range(10), weights=list(stats_weights[pos].values()), k=1)[0] for pos in range(6)]
+        digits = []
+        for pos in range(6):
+            w = list(stats_weights[pos].values())
+            if pension_mode == "🔥 연금 핫패턴형":
+                max_idx = max(range(len(w)), key=w.__getitem__)
+                w[max_idx] += 10.0
+            digits.append(random.choices(range(10), weights=w, k=1)[0])
+            
         digit_sum = sum(digits)
         score = (digit_sum * digits[-1] + group) % 100
-        p_grade = "S+급 (단일조 통계)" if score > 70 else ("A급 (밸런스)" if score > 35 else "B급 패턴")
+        p_grade = "S+급 (단일조 정밀)" if score > 70 else ("A급 (밸런스)" if score > 35 else "B급 패턴")
         return {"type": "single", "group": group, "digits": digits, "grade": p_grade, "sum": digit_sum}
     else:
+        # 전조 풀세트 모드: 조를 뺀 6자리 핵심 번호만 집중 최적화
         for _ in range(3000):
             digits = []
             for pos in range(6):
@@ -247,7 +254,7 @@ def generate_pension_game(pension_version, pension_mode):
             digits = [random.randint(0, 9) for _ in range(6)]
         digit_sum = sum(digits)
         score = (digit_sum * digits[-1]) % 100
-        p_grade = "S+급 (풀세트 최적화)" if score > 70 else ("A급 (밸런스 조합)" if score > 35 else "B급 패턴")
+        p_grade = "S+급 (전조 최적화)" if score > 70 else ("A급 (밸런스 조합)" if score > 35 else "B급 패턴")
         return {"type": "fullset", "digits": digits, "grade": p_grade, "sum": digit_sum}
 
 # ==========================================
@@ -311,7 +318,10 @@ if app_mode == "🎰 로또 6/45 퀀텀 Pro":
 
 elif app_mode == "🎟️ 연금복권 720+ 퀀텀 Pro":
     st.sidebar.markdown("### 🎛️ 연금복권 통계 전략 설정")
-    pension_version = st.sidebar.selectbox("구매 전략", ["🎫 단일 조 / 무작위 모드", "👑 전조(1~5조) 풀세트 최적화"])
+    pension_version = st.sidebar.selectbox(
+        "구매 전략", 
+        ["🎫 단일 조 모드 (조 + 6자리)", "👑 전조(1~5조) 풀세트 모드 (조 제외 6자리)"]
+    )
     pension_mode = st.sidebar.selectbox("연금 분석 모드", ["🧊 연금 균형분산형", "🔥 연금 핫패턴형"])
 
 else:
@@ -371,7 +381,12 @@ elif app_mode == "🎟️ 연금복권 720+ 퀀텀 Pro":
         for label in labels:
             p_game = generate_pension_game(pension_version, pension_mode)
             digits_html = "".join([f"<span class='pension-digit'>{d}</span>" for d in p_game['digits']])
-            badge_html = f"<span class='pension-group-badge'>{p_game['group']}조</span>" if p_game['type'] == 'single' else "<span class='pension-set-badge'>풀세트</span>"
+            
+            # 단일 조일 때는 'N조' 배지 출력, 전조일 때는 '전조(1~5조)' 배지 출력
+            if p_game['type'] == 'single':
+                badge_html = f"<span class='pension-group-badge'>{p_game['group']}조</span>"
+            else:
+                badge_html = "<span class='pension-set-badge'>전조(1~5조)</span>"
             
             st.markdown(f"""
                 <div class="result-card">
