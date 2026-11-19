@@ -48,7 +48,10 @@ def init_sports_db():
             row_key TEXT PRIMARY KEY, source_file TEXT, round_label TEXT, game_no TEXT,
             match_datetime TEXT, league TEXT, sport TEXT, bet_type TEXT, line REAL,
             home_team TEXT, away_team TEXT, odds1 REAL, oddsx REAL, odds2 REAL,
-            home_score INTEGER, away_score INTEGER, uploaded_at TEXT)""")
+            home_score INTEGER, away_score INTEGER, uploaded_at TEXT, total_score REAL)""")
+        cols = [r[1] for r in c.execute("PRAGMA table_info(matches)")]
+        if "total_score" not in cols:
+            c.execute("ALTER TABLE matches ADD COLUMN total_score REAL")
 
 
 def get_uploaded_files():
@@ -114,11 +117,14 @@ def save_matches(df, source_file, round_label, raw_bytes=None, saved_path=None):
         for _, r in df.iterrows():
             key = "|".join(str(x) for x in [r["match_datetime"], r["league"], r["bet_type"],
                                             r["line"], r["home_team"], r["away_team"]])
-            c.execute("""INSERT OR REPLACE INTO matches VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            c.execute("""INSERT OR REPLACE INTO matches(row_key, source_file, round_label, game_no, match_datetime, league, sport,
+                         bet_type, line, home_team, away_team, odds1, oddsx, odds2, home_score, away_score, uploaded_at, total_score)
+                         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                       (key, source_file, round_label, str(r["game_no"]), r["match_datetime"], r["league"],
                        r["sport"], r["bet_type"], _nz(r["line"]), r["home_team"], r["away_team"],
                        _nz(r["odds1"]), _nz(r["oddsx"]), _nz(r["odds2"]),
-                       _ni(r["home_score"]), _ni(r["away_score"]), ts))
+                       _ni(r["home_score"]), _ni(r["away_score"]), ts,
+                       _nz(r["total_score"]) if "total_score" in df.columns else None))
         c.execute("INSERT OR REPLACE INTO uploads VALUES(?,?,?,?,?,?)",
                   (source_file, round_label, fhash, ts, saved_path, len(df)))
     if saved_path:
@@ -167,9 +173,37 @@ def _ocr_pages(images, progress=None):
     return "\n".join(texts)
 
 
+def reparse_saved(source_file=None):
+    """저장돼 있는 원본(PDF/이미지/텍스트)을 현재 파서로 다시 읽어 DB 를 갱신. ※ 검수 표에서 손으로 고친 값은 원본 기준으로 되돌아간다."""
+    with _conn() as c:
+        q, a = "SELECT source_file, round_label, saved_path FROM uploads", ()
+        if source_file:
+            q, a = q + " WHERE source_file=?", (source_file,)
+        rows = c.execute(q, a).fetchall()
+    ok, fail = 0, []
+    for sf, lab, path in rows:
+        if not path or not os.path.exists(path):
+            fail.append(f"{sf} (원본 없음)")
+            continue
+        try:
+            raw = open(path, "rb").read()
+            text, _ = file_to_text(path, raw)
+            df = parse_text(text)
+            if df.empty:
+                fail.append(f"{sf} (읽힌 경기 없음)")
+                continue
+            save_matches(df, sf, lab, saved_path=path)
+            ok += 1
+        except Exception as e:
+            fail.append(f"{sf} ({e})")
+    return ok, fail
+
+
 def file_to_text(name, raw, progress=None):
     """텍스트 레이어가 있으면 그대로(정확), 없으면 OCR(부정확할 수 있음). return (text, method)"""
     from PIL import Image
+    if name.lower().endswith(".txt"):
+        return raw.decode("utf-8", "ignore"), "텍스트"
     if name.lower().endswith(".pdf"):
         try:
             from pypdf import PdfReader
@@ -192,8 +226,21 @@ STATUS_WORDS = {"경기전", "결기전", "경기건", "종료", "하프타임"}
 LEAGUE_STRIP = r"남축INTL|C네이션|남농EASL|KOVO[남여]|WKBL|KBL|NBA|MLS|A리그|J1리그|EASL|SUM|승.패"
 LEAGUES = [("WKBL", r"WKBL|여농"), ("KBL", r"KBL"), ("NBA", r"NBA|N8A|NEA|1484"), ("KOVO남", r"KOVO\s*남"),
            ("KOVO여", r"KOVO\s*여"), ("MLS", r"MLS"), ("A리그", r"A리그"), ("J1리그", r"J1?리그"),
-           ("EASL", r"EASL"), ("KBO", r"KBO"), ("MLB", r"MLB"), ("NPB", r"NPB"),
-           ("국가대표", r"INTL|네이션|남축")]
+           ("EASL", r"EASL"), ("KBO", r"KBO"), ("MLB", r"MLB"), ("NPB", r"NPB")]
+SOCCER_HINT = r"INTL|네이션|월드컵|친선|유로|예선|챔피언스|유로파|컨퍼런스|리그|컵|EPL|라리가|분데스|세리에|리그1|MLS|남축|여축"
+VOLLEY_HINT = r"KOVO|V리그|배구"
+BASKET_HINT = r"NBA|KBL|WKBL|EASL|CBA|농구|남농|여농"
+BASEBALL_HINT = r"KBO|MLB|NPB|야구"
+
+
+def sport_of_league(lg):
+    """알려진 리그면 그대로, 아니면 이름의 키워드로 종목 추정(못 맞히면 None → 배당 라인 크기로 추정)"""
+    if lg in SPORT_OF:
+        return SPORT_OF[lg]
+    for pat, sp in ((BASEBALL_HINT, "야구"), (VOLLEY_HINT, "배구"), (BASKET_HINT, "농구"), (SOCCER_HINT, "축구")):
+        if re.search(pat, lg or "", re.I):
+            return sp
+    return None
 SPORT_OF = {"NBA": "농구", "KBL": "농구", "WKBL": "농구", "EASL": "농구", "KOVO남": "배구", "KOVO여": "배구",
             "KBO": "야구", "MLB": "야구", "NPB": "야구", "MLS": "축구", "A리그": "축구", "J1리그": "축구", "국가대표": "축구"}
 DEFAULT_TOTAL = {"축구": 2.6, "농구": 215.0, "배구": 195.0, "야구": 8.5}
@@ -256,7 +303,12 @@ def parse_text(text, default_date=None):
         prev_dt = dt
 
         id_tok = toks[di - 1] if di > 0 and re.fullmatch(r"\d{3,4}", toks[di - 1]) else ""
-        rest = " ".join(toks[ti + 1:])
+        # 표의 열 순서: 번호 일시 리그 유형 홈팀 vs 원정팀 → 시간 바로 뒤 첫 칸이 '리그'(목록에 없는 리그도 인식)
+        lg_tok = toks[ti + 1] if ti + 1 < len(toks) else ""
+        if re.fullmatch(r"(?i)(H|U|SUM|hH|hU|h)", lg_tok) or re.fullmatch(r"[+-]?\d+(\.\d+)?", lg_tok):
+            lg_tok, rest = "", " ".join(toks[ti + 1:])
+        else:
+            rest = " ".join(toks[ti + 2:])
 
         # 유형
         bet, line = "일반", None
@@ -274,7 +326,7 @@ def parse_text(text, default_date=None):
         elif mu:
             bet, line = "U", _parse_line_value(mu.group(1), "U")
 
-        league = next((k for k, p in LEAGUES if re.search(p, rest, re.I)), None)
+        league = next((k for k, p in LEAGUES if re.search(p, lg_tok, re.I)), None) or (lg_tok or None)
 
         # 점수 (일반 행에서만 의미 있음)
         hs = as_ = None
@@ -294,13 +346,18 @@ def parse_text(text, default_date=None):
             v = _fix_odds_token(t)
             if v is not None and 1.01 <= v <= 60:
                 odds.append(v)
+        total_score = None
+        if bet in ("U", "SUM") and finished and len(team_words) >= 2:
+            mid = clean[team_words[0][1]:team_words[-1][0]]        # 홈팀과 원정팀 사이의 숫자 = 총 득점(배구는 세트가 아니라 총 점수)
+            mt = re.search(r"\d+(?:\.\d+)?", mid)
+            total_score = float(mt.group(0)) if mt else None
         names = [w[2] for w in team_words]
         home = names[0] if names else ""
         away = names[-1] if len(names) > 1 else ""
 
         rows.append(dict(game_no=id_tok, match_datetime=dt.strftime("%Y-%m-%d %H:%M"), league=league,
                          bet_type=bet, line=line, home_team=home, away_team=away, odds_raw=odds[:3],
-                         home_score=hs, away_score=as_, _names=names))
+                         home_score=hs, away_score=as_, total_score=total_score, _names=names))
     return _finalize(rows)
 
 
@@ -333,7 +390,7 @@ def _finalize(rows):
         home = next((n for (k, n), _ in names.most_common() if k == "h"), "")
         away = next((n for (k, n), _ in names.most_common() if k == "a"), "")
         big_line = any((r["line"] or 0) >= 100 for r in grp if r["bet_type"] == "U")
-        sport = SPORT_OF.get(league) or ("농구" if big_line else "축구")
+        sport = sport_of_league(league) or ("농구" if big_line else "축구")
         soccer3 = sport == "축구"
         for r in grp:
             o = r["odds_raw"]
@@ -345,7 +402,8 @@ def _finalize(rows):
                 o1, o2 = o[0], o[1]
             out.append(dict(game_no=r["game_no"], match_datetime=r["match_datetime"], league=league or "기타",
                             sport=sport, bet_type=r["bet_type"], line=r["line"], home_team=home, away_team=away,
-                            odds1=o1, oddsx=ox, odds2=o2, home_score=r["home_score"], away_score=r["away_score"]))
+                            odds1=o1, oddsx=ox, odds2=o2, home_score=r["home_score"], away_score=r["away_score"],
+                            total_score=r.get("total_score")))
     df = pd.DataFrame(out)
     return df.drop_duplicates(subset=["match_datetime", "league", "bet_type", "line", "home_team", "away_team"],
                               keep="last").reset_index(drop=True)
@@ -884,13 +942,25 @@ def _actual(r, hs, as_):
         if v > 1e-9: return "핸디승"
         if v < -1e-9: return "핸디패"
         return "핸디무" if pd.notna(r["oddsx"]) else None
+    tot = r.get("total_score") if hasattr(r, "get") else None
+    tot = hs + as_ if tot is None or pd.isna(tot) else tot          # 배구: 총 점수(행에 적힌 값) / 그 외: 스코어 합
     if bt == "U" and pd.notna(line):
-        t = hs + as_
-        return "오버" if t > line else ("언더" if t < line else None)
+        return "오버" if tot > line else ("언더" if tot < line else None)
+    if bt == "SUM":
+        return "홀" if int(tot) % 2 else "짝"
     if is_margin_bet(bt):
         n = int(line)
         return "승" if d > n else ("패" if d < -n else str(n))
     return None
+
+
+def slot_names(bt, line):
+    """배당 3칸(odds1/oddsx/odds2)이 각각 무엇을 뜻하는지"""
+    if is_margin_bet(bt):
+        n = str(int(line)) if line is not None and not pd.isna(line) else "5"
+        return ("승", n, "패")
+    return {"일반": ("홈승", "무", "원정승"), "H": ("핸디승", "핸디무", "핸디패"),
+            "U": ("언더", None, "오버"), "SUM": ("홀", None, "짝")}.get(bt, ("1", "X", "2"))
 
 
 def evaluate_finished(df_all, limit=300):

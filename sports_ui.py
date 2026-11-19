@@ -96,6 +96,57 @@ def _card(g):
             st.caption(r["pred_hist"])
 
 
+TYPE_ORDER = {"일반": 0, "승": 1, "H": 2, "U": 3, "SUM": 4}
+
+
+def _fmt(v):
+    return "-" if v is None or pd.isna(v) else f"{v:g}"
+
+
+def _past_card(g):
+    """한 경기(같은 시각·리그·홈·원정)를 카드 하나로: 유형별 줄, 결과, 이긴 배당은 초록색"""
+    rows = sorted(g.to_dict("records"), key=lambda r: (TYPE_ORDER.get("승" if sports.is_margin_bet(r["bet_type"]) else r["bet_type"], 9), str(r["game_no"])))
+    head = rows[0]
+    base = next((r for r in rows if r["bet_type"] == "일반"), None)
+    hs = as_ = None
+    if base is not None and pd.notna(base["home_score"]):
+        hs, as_ = int(base["home_score"]), int(base["away_score"])
+    color = BADGE.get(head["sport"], "#475569")
+    score_html = (f"<span style='background:#facc15;color:#111;padding:2px 8px;border-radius:6px;font-weight:bold;margin-left:8px'>최종 {hs} : {as_}</span>"
+                  if hs is not None else "<span style='color:#94a3b8;margin-left:8px;font-size:12px'>결과 없음(경기전·진행중)</span>")
+    trs = ""
+    for r in rows:
+        bt = r["bet_type"]
+        names = sports.slot_names(bt, r["line"])
+        act = sports._actual(r, hs, as_) if hs is not None else None
+        if bt == "일반": tname = "일반"
+        elif bt == "H": tname = f"핸디 {r['line']:+g}" if pd.notna(r["line"]) else "핸디"
+        elif bt == "U": tname = f"언더오버 {r['line']:g}" if pd.notna(r["line"]) else "언더오버"
+        elif bt == "SUM": tname = "홀짝"
+        else: tname = bt
+        cells = ""
+        for nm, odd in zip(names, (r["odds1"], r["oddsx"], r["odds2"])):
+            if nm is None:
+                cells += "<td style='padding:4px 6px'></td>"
+                continue
+            if act is None:
+                st_ = "background:#1e293b;color:#e2e8f0"
+            elif nm == act:
+                st_ = "background:#15803d;color:#fff;font-weight:bold;box-shadow:inset 0 0 0 2px #4ade80"
+            else:
+                st_ = "background:#0f172a;color:#64748b"
+            cells += f"<td style='padding:4px 6px;text-align:center;border-radius:6px;{st_}'><div style='font-size:10px;opacity:.85'>{nm}</div><div style='font-size:14px'>{_fmt(odd)}</div></td>"
+        res = f"<b style='color:#facc15'>{act}</b>" if act else "<span style='color:#475569'>-</span>"
+        trs += (f"<tr><td style='padding:4px 6px;color:#cbd5e1;white-space:nowrap;font-size:12px'>{tname}</td>{cells}"
+                f"<td style='padding:4px 6px;text-align:center;white-space:nowrap'>{res}</td></tr>")
+    st.markdown(f"""<div style="background:#1e293b;border:1px solid #334155;border-radius:12px;padding:10px 12px;margin-bottom:10px">
+      <span style="background:{color};color:#fff;padding:2px 6px;border-radius:4px;font-size:11px">{head['sport']} · {head['league']}</span>
+      <b style="color:#38bdf8;margin-left:6px">{head['match_datetime'][5:16]}</b>{score_html}
+      <div style="font-size:16px;font-weight:bold;margin:6px 0">🏠 {head['home_team']} <span style="color:#64748b;font-size:12px">vs</span> ✈️ {head['away_team']}</div>
+      <div style="overflow-x:auto"><table style="border-collapse:separate;border-spacing:4px 3px;width:100%"><tr style="color:#64748b;font-size:10px"><td>유형</td><td colspan="3" style="text-align:center">배당 (초록 = 실제 결과)</td><td style="text-align:center">결과</td></tr>{trs}</table></div></div>""",
+                unsafe_allow_html=True)
+
+
 def render(selected_sport):
     sports.init_sports_db()
     now = sports.now_kst()
@@ -148,9 +199,15 @@ def render(selected_sport):
                 sub = df[df.round_label == key]
             if selected_sport != "전체":
                 sub = sub[sub.sport == selected_sport]
-            st.dataframe(sub[["game_no", "match_datetime", "league", "bet_type", "line", "home_team", "away_team",
-                              "odds1", "oddsx", "odds2", "home_score", "away_score"]],
-                         use_container_width=True, hide_index=True)
+            keys = ["match_datetime", "league", "home_team", "away_team"]
+            ngames = sub[keys].drop_duplicates().shape[0]
+            st.caption(f"{ngames}경기 · 카드 안의 초록색 배당이 실제 결과입니다(최종 스코어가 있는 경기만).")
+            for _, g in sub.sort_values(["match_datetime", "game_no"]).groupby(keys, sort=False):
+                _past_card(g)
+            with st.expander("📋 원본 표로 보기"):
+                st.dataframe(sub[["game_no", "match_datetime", "league", "bet_type", "line", "home_team", "away_team",
+                                  "odds1", "oddsx", "odds2", "home_score", "away_score"]],
+                             use_container_width=True, hide_index=True)
 
     with t3:
         files = sports.get_uploaded_files()
@@ -158,7 +215,19 @@ def render(selected_sport):
             st.info("업로드된 파일이 없습니다.")
         else:
             st.dataframe(files, use_container_width=True, hide_index=True)
-            sel = st.selectbox("삭제할 파일", files["파일명"].tolist())
+            sel = st.selectbox("대상 파일 (다시 읽기 · 삭제)", files["파일명"].tolist())
+            st.caption("파서가 개선됐거나 팀·리그가 잘못 읽힌 경우, 저장돼 있는 원본으로 다시 읽을 수 있습니다. (검수 표에서 손으로 고친 값은 원본 기준으로 되돌아갑니다)")
+            r1, r2 = st.columns(2)
+            if r1.button("🔄 선택 파일 다시 읽기", use_container_width=True):
+                ok, fail = sports.reparse_saved(sel)
+                st.success(f"{ok}개 다시 읽기 완료") if ok else None
+                [st.error(f) for f in fail]
+            if r2.button("🔄 전체 파일 다시 읽기", use_container_width=True):
+                with st.spinner("다시 읽는 중…"):
+                    ok, fail = sports.reparse_saved()
+                st.success(f"{ok}개 다시 읽기 완료") if ok else None
+                [st.error(f) for f in fail]
+
             if st.button(f"🗑️ '{sel}' 삭제", type="primary"):
                 sports.delete_file_from_db(sel)
                 st.rerun()
