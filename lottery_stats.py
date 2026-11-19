@@ -5,6 +5,7 @@ lottery_stats.py - 로또/연금복권/파워볼: 업로드한 실제 과거 당
 import io, os, re, json, random, sqlite3
 from collections import Counter
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from itertools import combinations
 import pandas as pd
 import storage
@@ -123,7 +124,7 @@ def clear_game(game):
 
 
 def save_raw_upload(game, name, raw):
-    rel = f"uploads/{game}/{datetime.now():%Y%m%d_%H%M%S}_{os.path.basename(name)}"
+    rel = f"uploads/{game}/{datetime.now(ZoneInfo('Asia/Seoul')):%Y%m%d_%H%M%S}_{os.path.basename(name)}"
     p = os.path.join(DATA_DIR, rel)
     os.makedirs(os.path.dirname(p), exist_ok=True)
     open(p, "wb").write(raw)

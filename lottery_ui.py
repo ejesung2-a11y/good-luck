@@ -37,7 +37,7 @@ def upload_panel(game):
                 tot += L.save_draws(game, recs, f.name)
                 L.save_raw_upload(game, f.name, raw)
             if tot:
-                st.success(f"{tot}회차 저장 완료")
+                st.session_state["lot_msg"] = f"{tot}회차 저장 완료" + (" · ☁️ R2 에 백업됨" if storage.enabled() and not storage._state["error"] else "")
                 st.rerun()
         if draws and st.button("🗑️ 이 게임 데이터 전부 삭제", key=f"clr_{game}"):
             L.clear_game(game)
@@ -49,6 +49,10 @@ def render(game, mode="balanced", n_games=1, fixed=(), exclude=()):
     g = L.GAMES[game]
     st.markdown(f"<h2 style='text-align:center;color:white'>🎲 {g['name']}</h2>", unsafe_allow_html=True)
     draws = upload_panel(game)
+    if st.session_state.get("lot_msg"):
+        st.success(st.session_state.pop("lot_msg"))
+    if storage.enabled() and storage._state["error"]:
+        st.error("☁️ R2 저장 오류: " + storage._state["error"])
     if not draws:
         st.info("과거 당첨번호를 올리면 그 데이터로 통계를 계산합니다. 없으면 완전 무작위로 생성됩니다.")
     t1, t2, t3 = st.tabs(["🎯 번호 생성", "📊 통계 보기", "🧪 백테스트(무작위와 비교)"])
@@ -123,7 +127,18 @@ prefix = "quantum-lab/"''', language="toml")
     cal = football_calib.load()
     if cal:
         st.info(f"현재 보정표: {cal['n']:,}경기 · 출처 {cal['source']} · 사용 열 {cal['columns']}")
-    st.caption("GitHub(xgabora/Club-Football-Match-Data 등)·football-data.co.uk·FootyStats 에서 받은 CSV. 홈/무/원정 배당과 결과(H/D/A) 열이 있어야 합니다.")
+    c1, c2 = st.columns([3, 1])
+    gh = c1.text_input("GitHub CSV 주소", value=football_calib.GITHUB_PRESET, label_visibility="collapsed")
+    if c2.button("🐙 가져오기", use_container_width=True):
+        with st.spinner("내려받는 중(약 45MB)…"):
+            try:
+                out = football_calib.import_from_github(gh)
+                st.success(f"{out['n']:,}경기로 보정표 생성 완료")
+                st.rerun()
+            except Exception as e:
+                st.error(f"가져오기 실패: {e}")
+    st.caption("기본값은 xgabora/Club-Football-Match-Data(MIT 라이선스, 약 23만 경기, 배당+결과). 다른 CSV 주소도 가능합니다.")
+    st.caption("또는 직접 받은 CSV 업로드 — GitHub(xgabora/Club-Football-Match-Data 등)·football-data.co.uk·FootyStats 에서 받은 CSV. 홈/무/원정 배당과 결과(H/D/A) 열이 있어야 합니다.")
     f = st.file_uploader("CSV 업로드", type=["csv"], key="fb_csv")
     if f and st.button("📐 보정표 만들기", use_container_width=True):
         try:

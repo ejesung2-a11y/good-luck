@@ -87,15 +87,27 @@ def get_matches_by_file(source_file):
             ORDER BY match_datetime, game_no""", c, params=(source_file,))
 
 
-def save_matches(df, source_file, round_label, raw_bytes=None):
+def stash_raw(source_file, raw_bytes):
+    """읽기(파싱) 시점에 원본을 바로 저장·R2 업로드 → 검수 전에 창을 닫아도 원본은 남는다. 저장 경로 반환."""
+    stamp = now_kst().strftime("%Y%m%d_%H%M%S")
+    p = os.path.join(UPLOAD_DIR, f"{stamp}_{os.path.basename(source_file)}")
+    with open(p, "wb") as f:
+        f.write(raw_bytes)
+    storage.push(_rel(p))
+    return p
+
+
+def save_matches(df, source_file, round_label, raw_bytes=None, saved_path=None):
     """같은 경기(시각+종목+유형+라인+팀)가 이미 있으면 '최근 업로드'로 덮어쓴다."""
     ts = now_kst().strftime("%Y-%m-%d %H:%M:%S")
-    saved_path = ""
-    if raw_bytes is not None:
+    saved_path = saved_path or ""
+    if raw_bytes is not None and not saved_path:
         stamp = now_kst().strftime("%Y%m%d_%H%M%S")
         saved_path = os.path.join(UPLOAD_DIR, f"{stamp}_{os.path.basename(source_file)}")
         with open(saved_path, "wb") as f:
             f.write(raw_bytes)
+    if raw_bytes is None and saved_path and os.path.exists(saved_path):
+        raw_bytes = open(saved_path, "rb").read()
     fhash = hashlib.sha1(raw_bytes).hexdigest() if raw_bytes else ""
     with _conn() as c:
         c.execute("DELETE FROM matches WHERE source_file=?", (source_file,))

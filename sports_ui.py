@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import pandas as pd
 import sports
@@ -20,12 +21,12 @@ def sidebar():
             raw = f.getvalue()
             text, method = sports.file_to_text(f.name, raw, progress=bar.progress)
             st.session_state["pending"][f.name] = dict(
-                df=sports.parse_text(text), raw=raw, method=method,
+                df=sports.parse_text(text), raw=raw, path=sports.stash_raw(f.name, raw), method=method,
                 round=round_in or sports.guess_round_label(text))
         if pasted.strip():
             name = f"붙여넣기_{sports.now_kst():%Y%m%d_%H%M%S}.txt"
             st.session_state["pending"][name] = dict(
-                df=sports.parse_text(pasted), raw=pasted.encode(), method="텍스트 붙여넣기",
+                df=sports.parse_text(pasted), raw=pasted.encode(), path=sports.stash_raw(name, pasted.encode()), method="텍스트 붙여넣기",
                 round=round_in or sports.guess_round_label(pasted))
         bar.empty()
     st.sidebar.markdown("---")
@@ -48,10 +49,12 @@ def pending_review():
             edited = st.data_editor(df, num_rows="dynamic", use_container_width=True, key=f"ed_{name}", height=300)
             c1, c2 = st.columns(2)
             if c1.button("💾 저장(같은 경기는 최신으로 덮어쓰기)", key=f"sv_{name}", use_container_width=True):
-                sports.save_matches(edited, name, rl or "미지정", p["raw"])
+                sports.save_matches(edited, name, rl or "미지정", saved_path=p.get("path"))
                 del st.session_state["pending"][name]
                 st.rerun()
             if c2.button("버리기", key=f"dc_{name}", use_container_width=True):
+                if p.get("path") and os.path.exists(p["path"]):
+                    os.remove(p["path"]); sports.storage.remove(sports._rel(p["path"]))
                 del st.session_state["pending"][name]
                 st.rerun()
 
@@ -85,6 +88,8 @@ def render(selected_sport):
     if st.button("🔄 새로고침 (현재 시각 기준 경기전 다시 불러오기)", use_container_width=True):
         st.rerun()
     pending_review()
+    if sports.storage.enabled() and sports.storage._state["error"]:
+        st.error("☁️ R2 저장 오류: " + sports.storage._state["error"])
 
     df = sports.load_matches()
     t1, t2, t3, t4 = st.tabs(["🎯 경기전 예측", "📜 지난 경기", "📂 파일 관리", "💾 백업/복구"])
