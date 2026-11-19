@@ -70,7 +70,7 @@ def _card(g):
                 unsafe_allow_html=True)
     for _, r in g.iterrows():
         tname = {"일반": "일반", "H": f"핸디 {r['line']:+g}" if pd.notna(r["line"]) else "핸디",
-                 "U": f"언더오버 {r['line']:g}" if pd.notna(r["line"]) else "언더오버", "SUM": "홀짝"}.get(r["bet_type"], r["bet_type"])
+                 "U": f"언더오버 {r['line']:g}" if pd.notna(r["line"]) else "언더오버", "SUM": "홀짝"}.get(r["bet_type"], r["bet_type"])  # 승N패 는 그대로 표시
         label = r["pred_label"]
         prob = f"{r['pred_prob']*100:.0f}%" if pd.notna(r["pred_prob"]) else "-"
         odds = " / ".join(f"{x:g}" for x in [r["odds1"], r["oddsx"], r["odds2"]] if pd.notna(x)) or "미발매"
@@ -92,7 +92,7 @@ def render(selected_sport):
         st.error("☁️ R2 저장 오류: " + sports.storage._state["error"])
 
     df = sports.load_matches()
-    t1, t2, t3, t4 = st.tabs(["🎯 경기전 예측", "📜 지난 경기", "📂 파일 관리", "💾 백업/복구"])
+    t1, t2, t3, t4, t5 = st.tabs(["🎯 경기전 예측", "📜 지난 경기", "📂 파일 관리", "💾 백업/복구", "📈 학습 현황"])
 
     with t1:
         if df.empty:
@@ -157,3 +157,23 @@ def render(selected_sport):
             sports.import_backup(up_zip.getvalue())
             st.success("복구 완료")
             st.rerun()
+
+
+    with t5:
+        done = df[df.home_score.notna() & (df.bet_type == "일반")] if not df.empty else df
+        st.write(f"**학습에 쓰이는 끝난 경기: {len(done)}경기** (경기 결과 스코어가 PDF에 있는 경기만)")
+        if len(done):
+            st.dataframe(done.groupby("sport").size().rename("끝난 경기 수").reset_index(), hide_index=True)
+        st.caption("지난 회차 PDF를 올릴수록 팀별·종목별 보정이 쌓이고, 아래 점검의 표본이 늘어 신뢰도가 올라갑니다.")
+        if len(done) >= 10 and st.button("🧪 과거 경기 적중률 점검 (그 경기 이전 데이터만으로 재예측)", use_container_width=True):
+            with st.spinner("계산 중…"):
+                ev, ng = sports.evaluate_finished(df)
+            if ev.empty:
+                st.info("점검할 수 있는 경기가 없습니다.")
+            else:
+                st.write(f"점검 {ng}경기 · 예측 {len(ev)}건")
+                tbl = ev.groupby(["유형", "라벨"]).agg(건수=("적중", "size"), 적중률=("적중", "mean"), 평균예상확률=("예상확률", "mean")).reset_index()
+                tbl["적중률"] = (tbl["적중률"] * 100).round(1).astype(str) + "%"
+                tbl["평균예상확률"] = (tbl["평균예상확률"] * 100).round(1).astype(str) + "%"
+                st.dataframe(tbl, hide_index=True, use_container_width=True)
+                st.caption("라벨(🟢강력/🟡유력…)이 높을수록 적중률도 높아야 정상입니다. 표본이 30건 미만인 칸은 우연일 수 있습니다.")

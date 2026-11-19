@@ -71,6 +71,22 @@ def _ints(row):
     return out
 
 
+def _find_window(game, ints):
+    """행의 정수열에서 '오름차순 당첨번호 k개 + 보너스/파워볼' 구간을 찾는다.
+    당첨자 수·금액 같은 다른 숫자 칸이 섞여 있어도(동행복권 엑셀) 인식하도록 구간 탐색.
+    회차 = 구간 앞쪽의 첫 정수."""
+    g = GAMES[game]
+    k, hi = g["k"], g["hi"]
+    for i in range(1, len(ints) - k):
+        nums, ex = ints[i:i + k], ints[i + k]
+        if all(1 <= v <= hi for v in nums) and all(a < b for a, b in zip(nums, nums[1:])):
+            if game == "lotto" and 1 <= ex <= 45 and ex not in nums:
+                return ints[0], nums, ex
+            if game == "powerball" and 0 <= ex <= 9:
+                return ints[0], nums, ex
+    return None
+
+
 def parse_upload(game, name, raw):
     g = GAMES[game]
     recs = []
@@ -88,15 +104,9 @@ def parse_upload(game, name, raw):
                     recs.append((ints[0], ints[2:8], ints[1]))
             continue
         ints = _ints(row)
-        k = g["k"]
-        if game == "lotto" and len(ints) >= k + 2:        # 회차, n1..n6, 보너스
-            rd, nums = ints[0], ints[1:1 + k]
-            if all(1 <= v <= 45 for v in nums) and len(set(nums)) == k:
-                recs.append((rd, sorted(nums), ints[1 + k] if 1 <= ints[1 + k] <= 45 else None))
-        elif game == "powerball" and len(ints) >= k + 2:  # 회차, 5개, 파워볼
-            rd, nums = ints[0], ints[1:1 + k]
-            if all(1 <= v <= 28 for v in nums) and len(set(nums)) == k and 0 <= ints[1 + k] <= 9:
-                recs.append((rd, sorted(nums), ints[1 + k]))
+        w = _find_window(game, ints)
+        if w:
+            recs.append(w)
     return recs
 
 
@@ -107,6 +117,15 @@ def save_draws(game, recs, source):
             c.execute("INSERT OR REPLACE INTO draws VALUES(?,?,?,?,?)", (game, int(rd), json.dumps(nums), extra, source))
     _sync()
     return len(recs)
+
+
+def summary(draws):
+    """업로드 점검용: 회차 범위와 누락 회차"""
+    if not draws:
+        return None
+    rounds = [d["round"] for d in draws]
+    miss = sorted(set(range(min(rounds), max(rounds) + 1)) - set(rounds))
+    return dict(n=len(rounds), first=min(rounds), last=max(rounds), missing=miss)
 
 
 def load_draws(game):

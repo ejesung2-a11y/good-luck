@@ -24,6 +24,9 @@ def upload_panel(game):
     draws = L.load_draws(game)
     with st.expander(f"📥 {g['name']} 과거 당첨번호 업로드 (현재 {len(draws)}회차 저장됨"
                      + (f", 최신 {draws[-1]['round']}회)" if draws else ")"), expanded=not draws):
+        sm = L.summary(draws)
+        if sm:
+            st.info(f"저장됨: {sm['n']}회차 ({sm['first']}~{sm['last']}회)" + (f" · ⚠️ 누락 {len(sm['missing'])}개 회차: {sm['missing'][:15]}{'…' if len(sm['missing']) > 15 else ''}" if sm["missing"] else " · 누락 없음 ✅"))
         st.caption(FORMAT_HELP[game] + " · CSV / 엑셀(xlsx) / 표를 복사해 만든 txt 모두 가능 · 같은 회차는 최근 업로드로 덮어씁니다.")
         up = st.file_uploader("파일 선택", type=["csv", "xlsx", "xls", "txt"], accept_multiple_files=True, key=f"up_{game}")
         if up and st.button("💾 읽어서 저장", key=f"sv_{game}", use_container_width=True):
