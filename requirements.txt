@@ -1,0 +1,9 @@
+streamlit
+pandas
+pypdf
+pypdfium2
+pytesseract
+pillow
+requests
+boto3
+openpyxl

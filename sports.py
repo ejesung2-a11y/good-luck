@@ -1,0 +1,614 @@
+"""
+sports.py  -  와이즈토토(프로토 승부식) 경기전 예측 엔진
+ - 입력: PDF(텍스트형/이미지형) 또는 PNG/JPG 캡처  ->  OCR -> 행 파싱 -> (사용자 검수) -> DB 누적 저장
+ - 예측: 배당 마진 제거(진확률) + 포아송/정규분포 점수 모델 + 누적 학습 보정(팀 폼)
+ - 모든 시각은 한국시간(KST) 기준
+"""
+import io, os, re, math, json, sqlite3, hashlib, zipfile
+from collections import Counter
+from datetime import datetime, timedelta
+from statistics import NormalDist
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+import storage
+import football_calib
+
+KST = ZoneInfo("Asia/Seoul")
+DATA_DIR = "data"
+UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
+DB_PATH = os.path.join(DATA_DIR, "sports_quantum.db")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+def now_kst():
+    return datetime.now(KST).replace(tzinfo=None)
+
+
+# ───────────────────────── DB ─────────────────────────
+def _conn():
+    return sqlite3.connect(DB_PATH)
+
+
+def _rel(p):
+    return os.path.relpath(p, DATA_DIR)
+
+
+def _sync_db():
+    storage.push(_rel(DB_PATH))
+
+
+def init_sports_db():
+    storage.restore_once()
+    with _conn() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS uploads(
+            source_file TEXT PRIMARY KEY, round_label TEXT, file_hash TEXT,
+            uploaded_at TEXT, saved_path TEXT, row_count INTEGER)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS matches(
+            row_key TEXT PRIMARY KEY, source_file TEXT, round_label TEXT, game_no TEXT,
+            match_datetime TEXT, league TEXT, sport TEXT, bet_type TEXT, line REAL,
+            home_team TEXT, away_team TEXT, odds1 REAL, oddsx REAL, odds2 REAL,
+            home_score INTEGER, away_score INTEGER, uploaded_at TEXT)""")
+
+
+def get_uploaded_files():
+    with _conn() as c:
+        return pd.read_sql("""SELECT u.source_file AS 파일명, u.round_label AS 회차, u.row_count AS 행수,
+            u.uploaded_at AS 업로드시각 FROM uploads u ORDER BY u.uploaded_at DESC""", c)
+
+
+def delete_file_from_db(source_file):
+    with _conn() as c:
+        row = c.execute("SELECT saved_path FROM uploads WHERE source_file=?", (source_file,)).fetchone()
+        c.execute("DELETE FROM matches WHERE source_file=?", (source_file,))
+        c.execute("DELETE FROM uploads WHERE source_file=?", (source_file,))
+    if row and row[0] and os.path.exists(row[0]):
+        os.remove(row[0])
+        storage.remove(_rel(row[0]))
+    _sync_db()
+
+
+def clear_sports_db():
+    with _conn() as c:
+        c.execute("DELETE FROM matches"); c.execute("DELETE FROM uploads")
+    _sync_db()
+
+
+def load_matches():
+    with _conn() as c:
+        df = pd.read_sql("SELECT * FROM matches ORDER BY match_datetime, game_no", c)
+    return df
+
+
+def get_matches_by_file(source_file):
+    with _conn() as c:
+        return pd.read_sql("""SELECT game_no, match_datetime, league, sport, bet_type, line, home_team, away_team,
+            odds1, oddsx, odds2, home_score, away_score FROM matches WHERE source_file=?
+            ORDER BY match_datetime, game_no""", c, params=(source_file,))
+
+
+def save_matches(df, source_file, round_label, raw_bytes=None):
+    """같은 경기(시각+종목+유형+라인+팀)가 이미 있으면 '최근 업로드'로 덮어쓴다."""
+    ts = now_kst().strftime("%Y-%m-%d %H:%M:%S")
+    saved_path = ""
+    if raw_bytes is not None:
+        stamp = now_kst().strftime("%Y%m%d_%H%M%S")
+        saved_path = os.path.join(UPLOAD_DIR, f"{stamp}_{os.path.basename(source_file)}")
+        with open(saved_path, "wb") as f:
+            f.write(raw_bytes)
+    fhash = hashlib.sha1(raw_bytes).hexdigest() if raw_bytes else ""
+    with _conn() as c:
+        c.execute("DELETE FROM matches WHERE source_file=?", (source_file,))
+        for _, r in df.iterrows():
+            key = "|".join(str(x) for x in [r["match_datetime"], r["league"], r["bet_type"],
+                                            r["line"], r["home_team"], r["away_team"]])
+            c.execute("""INSERT OR REPLACE INTO matches VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                      (key, source_file, round_label, str(r["game_no"]), r["match_datetime"], r["league"],
+                       r["sport"], r["bet_type"], _nz(r["line"]), r["home_team"], r["away_team"],
+                       _nz(r["odds1"]), _nz(r["oddsx"]), _nz(r["odds2"]),
+                       _ni(r["home_score"]), _ni(r["away_score"]), ts))
+        c.execute("INSERT OR REPLACE INTO uploads VALUES(?,?,?,?,?,?)",
+                  (source_file, round_label, fhash, ts, saved_path, len(df)))
+    if saved_path:
+        storage.push(_rel(saved_path))
+    _sync_db()
+
+
+def _nz(v):
+    return None if v is None or (isinstance(v, float) and math.isnan(v)) else float(v)
+
+
+def _ni(v):
+    return None if v is None or (isinstance(v, float) and math.isnan(v)) else int(v)
+
+
+# ── 백업/복구 (Streamlit Cloud 는 재배포·재시작 시 디스크가 초기화되므로 필수) ──
+def export_backup():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for root, _, files in os.walk(DATA_DIR):
+            for fn in files:
+                p = os.path.join(root, fn)
+                z.write(p, os.path.relpath(p, DATA_DIR))
+    return buf.getvalue()
+
+
+def import_backup(zip_bytes):
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+        z.extractall(DATA_DIR)
+
+
+# ───────────────────── 입력(PDF/이미지) → 텍스트 ─────────────────────
+def _ocr_pages(images, progress=None):
+    import pytesseract
+    from PIL import ImageOps
+    texts = []
+    for i, im in enumerate(images):
+        im = im.convert("L")
+        if im.width < 2400:                       # 작은 글씨 → 확대
+            f = 2400 / im.width
+            im = im.resize((int(im.width * f), int(im.height * f)))
+        im = ImageOps.autocontrast(im)
+        texts.append(pytesseract.image_to_string(im, lang="kor+eng", config="--psm 6"))
+        if progress:
+            progress((i + 1) / len(images))
+    return "\n".join(texts)
+
+
+def file_to_text(name, raw, progress=None):
+    """텍스트 레이어가 있으면 그대로(정확), 없으면 OCR(부정확할 수 있음). return (text, method)"""
+    from PIL import Image
+    if name.lower().endswith(".pdf"):
+        try:
+            from pypdf import PdfReader
+            txt = "\n".join((p.extract_text() or "") for p in PdfReader(io.BytesIO(raw)).pages)
+            if len(re.findall(r"\d{1,2}\.\d{2}", txt)) >= 10:
+                return txt, "PDF 텍스트"
+        except Exception:
+            pass
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(raw)
+        imgs = [pdf[i].render(scale=4).to_pil() for i in range(len(pdf))]
+        return _ocr_pages(imgs, progress), "OCR(이미지 PDF)"
+    return _ocr_pages([Image.open(io.BytesIO(raw))], progress), "OCR(이미지)"
+
+
+# ───────────────────── 텍스트 → 행 파싱 ─────────────────────
+RESULT_WORDS = {"홈승", "홈패", "핸디승", "핸디패", "핸디무", "언더", "오버", "홀", "짝", "⑤", "무"}
+STATUS_WORDS = {"경기전", "결기전", "경기건", "종료", "하프타임"} | RESULT_WORDS
+LEAGUE_STRIP = r"남축INTL|C네이션|남농EASL|KOVO[남여]|WKBL|KBL|NBA|MLS|A리그|J1리그|EASL|SUM|승⑤패"
+LEAGUES = [("WKBL", r"WKBL|여농"), ("KBL", r"KBL"), ("NBA", r"NBA|N8A|NEA|1484"), ("KOVO남", r"KOVO\s*남"),
+           ("KOVO여", r"KOVO\s*여"), ("MLS", r"MLS"), ("A리그", r"A리그"), ("J1리그", r"J1?리그"),
+           ("EASL", r"EASL"), ("KBO", r"KBO"), ("MLB", r"MLB"), ("NPB", r"NPB"),
+           ("국가대표", r"INTL|네이션|남축")]
+SPORT_OF = {"NBA": "농구", "KBL": "농구", "WKBL": "농구", "EASL": "농구", "KOVO남": "배구", "KOVO여": "배구",
+            "KBO": "야구", "MLB": "야구", "NPB": "야구", "MLS": "축구", "A리그": "축구", "J1리그": "축구", "국가대표": "축구"}
+DEFAULT_TOTAL = {"축구": 2.6, "농구": 215.0, "배구": 195.0, "야구": 8.5}
+SIGMA = {"NBA": 13.0, "KBL": 11.5, "WKBL": 10.5, "EASL": 12.0}
+
+
+def _fix_odds_token(tok):
+    tok = tok.replace(",", ".").strip("!|[]()↑↓")
+    if re.fullmatch(r"\d{1,2}\.\d{2}", tok):
+        return float(tok)
+    if re.fullmatch(r"\d{3,4}", tok):                 # OCR 이 소수점을 놓친 경우 180 → 1.80, 2100 → 21.00
+        v = float(tok[:-2] + "." + tok[-2:])
+        return v
+    return None
+
+
+def _parse_line_value(s, kind):
+    s = s.replace(",", ".")
+    m = re.search(r"[+-]?\d+(?:\.\d+)?", s)
+    if not m:
+        return None
+    t = m.group(0)
+    if "." not in t:
+        sign = -1 if t.startswith("-") else 1
+        d = t.lstrip("+-")
+        if kind == "H":
+            v = float(d) if len(d) == 1 else float(d[:-1] + "." + d[-1])
+        else:
+            v = float(d) if len(d) <= 1 else (float(d[:-1] + "." + d[-1]) if len(d) <= 2 or len(d) == 4 else float(d))
+        return sign * v if kind == "H" else v
+    return float(t)
+
+
+def parse_text(text, default_date=None):
+    text = re.sub(r"[\x00-\x08\x0b-\x1f\u00a0]", " ", text)      # PDF 가 칸 사이에 넣는 제어문자 제거
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    rows, prev_dt = [], None
+    for ln in lines:
+        toks = ln.split()
+        di = next((i for i, t in enumerate(toks) if re.match(r"^\d{1,2}\.\d{2}", t)), None)
+        if di is None:
+            continue
+        m = re.match(r"^(\d{1,2})\.(\d{2})", toks[di])
+        mo, dd = int(m.group(1)), int(m.group(2))
+        ti = next((i for i in range(di + 1, min(di + 4, len(toks)))
+                   if re.fullmatch(r"\(?\d{1,2}:?\d{2}\)?", toks[i])), None)
+        if ti is None:
+            continue
+        tm = re.sub(r"\D", "", toks[ti]).zfill(4)
+        hh, mi = int(tm[:-2]), int(tm[-2:])
+        year = (default_date or now_kst()).year
+        try:
+            dt = datetime(year, mo, dd, hh, mi)
+        except ValueError:
+            dt = prev_dt                                 # OCR 오인식 → 직전 행 시각
+        if dt is None:
+            continue
+        if prev_dt and dt < prev_dt and (prev_dt - dt) < timedelta(days=2):
+            dt = prev_dt                                 # 목록은 시간순 → 역행은 OCR 오류
+        prev_dt = dt
+
+        id_tok = toks[di - 1] if di > 0 and re.fullmatch(r"\d{3,4}", toks[di - 1]) else ""
+        rest = " ".join(toks[ti + 1:])
+
+        # 유형
+        bet, line = "일반", None
+        mh = re.search(r"\bH\s*([+-]?\s*\d+(?:[.,]\d)?)", rest)
+        mu = re.search(r"\b[UuO]\s*(\d+(?:[.,]\d)?)", rest)
+        if re.search(r"승\S?패", rest):
+            bet = "승5패"
+        elif re.search(r"\bs[uv]m\b", rest, re.I):
+            bet = "SUM"
+        elif mh:
+            bet, line = "H", _parse_line_value(mh.group(1).replace(" ", ""), "H")
+        elif mu:
+            bet, line = "U", _parse_line_value(mu.group(1), "U")
+
+        league = next((k for k, p in LEAGUES if re.search(p, rest, re.I)), None)
+
+        # 점수 (일반 행에서만 의미 있음)
+        hs = as_ = None
+        ms = re.search(r"(\d{1,3})\s*:\s*(\d{1,3})\b", rest)
+        finished = bool(toks) and toks[-1] in RESULT_WORDS
+        if ms and bet == "일반" and finished:
+            hs, as_ = int(ms.group(1)), int(ms.group(2))
+
+        # 팀/배당 영역 분리: 마지막 한글 단어(상태칩 제외) 뒤를 배당으로
+        clean = re.sub(LEAGUE_STRIP, lambda m_: " " * len(m_.group(0)), rest)
+        kor = [(m2.start(), m2.end(), m2.group(0)) for m2 in re.finditer(r"[가-힣A-Za-z][가-힣A-Za-z0-9*]+", clean)]
+        team_words = [w for w in kor if w[2] not in STATUS_WORDS]
+        odds_start = team_words[-1][1] if team_words else 0
+        odds_txt = rest[odds_start:]
+        odds = []
+        for t in re.split(r"\s+", odds_txt):
+            v = _fix_odds_token(t)
+            if v is not None and 1.01 <= v <= 60:
+                odds.append(v)
+        names = [w[2] for w in team_words]
+        home = names[0] if names else ""
+        away = names[-1] if len(names) > 1 else ""
+
+        rows.append(dict(game_no=id_tok, match_datetime=dt.strftime("%Y-%m-%d %H:%M"), league=league,
+                         bet_type=bet, line=line, home_team=home, away_team=away, odds_raw=odds[:3],
+                         home_score=hs, away_score=as_, _names=names))
+    return _finalize(rows)
+
+
+def _finalize(rows):
+    if not rows:
+        return pd.DataFrame()
+    # 게임 그룹: '일반' 행이 새 게임의 시작
+    gid, cur = [], -1
+    for r in rows:
+        if r["bet_type"] == "일반":
+            cur += 1
+        gid.append(max(cur, 0))
+    for r, g in zip(rows, gid):
+        r["_g"] = g
+    out = []
+    by_g = {}
+    for r in rows:
+        by_g.setdefault(r["_g"], []).append(r)
+    last_league = None
+    for g, grp in by_g.items():
+        leagues = [r["league"] for r in grp if r["league"]]
+        league = Counter(leagues).most_common(1)[0][0] if leagues else last_league
+        last_league = league or last_league
+        names = Counter()
+        for r in grp:
+            if r["home_team"]:
+                names[("h", r["home_team"])] += 1
+            if r["away_team"]:
+                names[("a", r["away_team"])] += 1
+        home = next((n for (k, n), _ in names.most_common() if k == "h"), "")
+        away = next((n for (k, n), _ in names.most_common() if k == "a"), "")
+        big_line = any((r["line"] or 0) >= 100 for r in grp if r["bet_type"] == "U")
+        sport = SPORT_OF.get(league) or ("농구" if big_line else "축구")
+        soccer3 = sport == "축구"
+        for r in grp:
+            o = r["odds_raw"]
+            o1 = ox = o2 = None
+            three = soccer3 and r["bet_type"] in ("일반", "H")
+            if three and len(o) >= 3:
+                o1, ox, o2 = o[0], o[1], o[2]
+            elif len(o) >= 2:
+                o1, o2 = o[0], o[1]
+            out.append(dict(game_no=r["game_no"], match_datetime=r["match_datetime"], league=league or "기타",
+                            sport=sport, bet_type=r["bet_type"], line=r["line"], home_team=home, away_team=away,
+                            odds1=o1, oddsx=ox, odds2=o2, home_score=r["home_score"], away_score=r["away_score"]))
+    df = pd.DataFrame(out)
+    return df.drop_duplicates(subset=["match_datetime", "league", "bet_type", "line", "home_team", "away_team"],
+                              keep="last").reset_index(drop=True)
+
+
+def guess_round_label(text):
+    m = re.search(r"(\d{2,3})\s*회\s*차", text)
+    return f"{m.group(1)}회차" if m else ""
+
+
+# ───────────────────── 확률 모델 ─────────────────────
+def devig(odds):
+    """배당 → 진확률 (power 방식: Σ(1/o)^c = 1 이 되는 c 를 이분법으로)"""
+    inv = [1 / o for o in odds]
+    if abs(sum(inv) - 1) < 1e-9:
+        return inv
+    lo, hi = 0.5, 4.0
+    for _ in range(60):
+        c = (lo + hi) / 2
+        s = sum(p ** c for p in inv)
+        lo, hi = (c, hi) if s > 1 else (lo, c)
+    ps = [p ** ((lo + hi) / 2) for p in inv]
+    t = sum(ps)
+    return [p / t for p in ps]
+
+
+def _pois(k, lam):
+    return math.exp(-lam) * lam ** k / math.factorial(k)
+
+
+def _score_matrix(lh, la, n=14):
+    return [[_pois(i, lh) * _pois(j, la) for j in range(n)] for i in range(n)]
+
+
+def _outcome_probs(M):
+    ph = sum(M[i][j] for i in range(len(M)) for j in range(len(M)) if i > j)
+    pd_ = sum(M[i][i] for i in range(len(M)))
+    pa = sum(M[i][j] for i in range(len(M)) for j in range(len(M)) if i < j)
+    return ph, pd_, pa
+
+
+def fit_poisson(p_home, p_draw, p_away, total):
+    """승/무/패 진확률과 총득점 기대치로 (홈 기대득점, 원정 기대득점) 역산"""
+    best, best_err = (total / 2, total / 2), 9
+    for k in range(-60, 61):
+        d = k * 0.05
+        lh, la = max(0.05, (total + d) / 2), max(0.05, (total - d) / 2)
+        ph, px, pa = _outcome_probs(_score_matrix(lh, la))
+        if p_draw is None:                              # 무승부 없는 종목: 무 제외 후 비교
+            s = ph + pa
+            err = (ph / s - p_home / (p_home + p_away)) ** 2
+        else:
+            err = (ph - p_home) ** 2 + (px - p_draw) ** 2 + (pa - p_away) ** 2
+        if err < best_err:
+            best, best_err = (lh, la), err
+    return best
+
+
+def _set_win_prob(q):                                   # 5세트제 매치 승리확률
+    return q**3 * (1 + 3 * (1 - q) + 6 * (1 - q) ** 2)
+
+
+def fit_set_prob(p_match):
+    lo, hi = 0.01, 0.99
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if _set_win_prob(mid) < p_match else (lo, mid)
+    return (lo + hi) / 2
+
+
+def team_form(learn_df):
+    """종료된 '일반' 경기(점수 있음)에서 팀별 (실제결과 - 배당 내재확률) 평균 → 폼 보정치"""
+    form = {}
+    if learn_df.empty:
+        return form
+    d = learn_df[(learn_df.bet_type == "일반") & learn_df.home_score.notna() & learn_df.odds1.notna() & learn_df.odds2.notna()]
+    for _, r in d.iterrows():
+        odds = [r.odds1] + ([r.oddsx] if pd.notna(r.oddsx) else []) + [r.odds2]
+        try:
+            p = devig(odds)
+        except Exception:
+            continue
+        ph, pa = p[0], p[-1]
+        hw = 1.0 if r.home_score > r.away_score else 0.0
+        aw = 1.0 if r.away_score > r.home_score else 0.0
+        form.setdefault(r.home_team, []).append(hw - ph)
+        form.setdefault(r.away_team, []).append(aw - pa)
+    return {t: (sum(v) / len(v), len(v)) for t, v in form.items()}
+
+
+def _adj(form, team):
+    if team not in form:
+        return 0.0, 0
+    mean, n = form[team]
+    shrink = n / (n + 12)                               # 표본이 적을수록 거의 0
+    return max(-0.05, min(0.05, 0.5 * shrink * mean)), n
+
+
+def confidence_label(p, n_way=2):
+    thr = (0.65, 0.52, 0.42) if n_way == 2 else (0.58, 0.46, 0.38)
+    if p >= thr[0]:
+        return "🟢 강력"
+    if p >= thr[1]:
+        return "🟡 유력"
+    if p >= thr[2]:
+        return "🟠 낮음"
+    return "🔴 위험"
+
+
+def has_odds(r):
+    return pd.notna(r["odds1"]) and pd.notna(r["odds2"])
+
+
+def odds_ok(r):
+    """배당이 정상적으로 읽혔는지 검사: 역수합(1/o 합)이 1.02~1.45 안이어야 정상(발매사 마진 5~30%)"""
+    o = [r["odds1"], r["oddsx"], r["odds2"]]
+    o = [x for x in o if x is not None and not pd.isna(x)]
+    if len(o) < 2:
+        return False
+    return 1.02 <= sum(1 / x for x in o) <= 1.45
+
+
+def predict_game(rows, form):
+    """rows: 같은 경기의 행들(일반/H/U/SUM). return {row_index: dict}"""
+    base = next((r for r in rows if r["bet_type"] == "일반"), None)
+    res = {}
+    sport = rows[0]["sport"]; league = rows[0]["league"]
+    home, away = rows[0]["home_team"], rows[0]["away_team"]
+    uline = next((r["line"] for r in rows if r["bet_type"] == "U" and r["line"]), None)
+    total = uline if uline else DEFAULT_TOTAL.get(sport, 2.6)
+
+    model = None
+    if base and has_odds(base) and odds_ok(base):
+        three = base["oddsx"] is not None and not pd.isna(base["oddsx"])
+        p = devig([base["odds1"]] + ([base["oddsx"]] if three else []) + [base["odds2"]])
+        ph, px, pa = (p[0], p[1], p[2]) if three else (p[0], 0.0, p[1])
+        ah, n_h = _adj(form, home); aa, n_a = _adj(form, away)
+        ph2, pa2 = ph + ah - aa * 0.5, pa + aa - ah * 0.5
+        s = ph2 + px + pa2
+        ph2, px, pa2 = ph2 / s, px / s, pa2 / s
+        cal_n = None
+        if sport == "축구" and three:                    # 해외 축구 CSV 로 만든 보정표 적용(있을 때만)
+            ph2, px, pa2, cal_n = football_calib.calibrate(ph2, px, pa2)
+        model = dict(cal_n=cal_n, total=total, ph=ph2, px=px, pa=pa2, ph0=ph, pa0=pa, three=three, adj=(ah, aa, n_h, n_a),
+                     over=(1 / base["odds1"] + (1 / base["oddsx"] if three else 0) + 1 / base["odds2"]))
+        if sport in ("축구", "야구"):
+            lh, la = fit_poisson(ph2, px if three else None, pa2, total)
+            model["lam"] = (lh, la)
+        elif sport == "농구":
+            sig = SIGMA.get(league, 12.0)
+            z = NormalDist().inv_cdf(min(max(ph2 / (ph2 + pa2), 0.02), 0.98))
+            model["mu"], model["sig"] = sig * z, sig
+        elif sport == "배구":
+            model["q"] = fit_set_prob(min(max(ph2 / (ph2 + pa2), 0.03), 0.97))
+
+    for idx, r in enumerate(rows):
+        bt = r["bet_type"]
+        if bt not in ("승5패", "SUM") and has_odds(r) and not odds_ok(r):
+            res[idx] = dict(pick="검수 필요", score="-", prob=None, label="⚠️ 검수",
+                            why="배당 숫자가 비정상(OCR 오인식 가능) → 예측하지 않음. 파일 검수 표에서 수정하세요.", upset=None)
+            continue
+        if not has_odds(r):
+            res[idx] = dict(pick="배당 미발매", score="-", prob=None, label="⏳ 대기", why="국내 배당이 아직 없어 예측하지 않습니다.", upset=None)
+            continue
+        if bt == "승5패":
+            res[idx] = dict(pick="예측 제외", score="-", prob=None, label="⚪ 제외", why="승5패(5점차 승부)는 별도 모델이 없어 제외합니다.", upset=None)
+            continue
+        if bt == "SUM":
+            res[idx] = dict(pick="예측 제외", score="-", prob=None, label="⚪ 제외", why="홀짝은 통계적으로 50:50 에 가까워 예측 근거가 없습니다.", upset=None)
+            continue
+        three_row = r["oddsx"] is not None and not pd.isna(r["oddsx"])
+        mk = devig([r["odds1"]] + ([r["oddsx"]] if three_row else []) + [r["odds2"]])
+        payout = 100 / sum(1 / o for o in ([r["odds1"]] + ([r["oddsx"]] if three_row else []) + [r["odds2"]]))
+
+        if bt == "일반" and model:
+            ph, px, pa = model["ph"], model["px"], model["pa"]
+            opts = [("홈승", ph), ("무", px), ("원정승", pa)] if model["three"] else [("홈승", ph), ("원정승", pa)]
+            pick, pp = max(opts, key=lambda x: x[1])
+            under = min(opts, key=lambda x: x[1] if x[0] != "무" else 9)
+            score = _score_text(sport, model, pick)
+            adj = model["adj"]
+            adj_txt = f" / 학습보정 홈{adj[0]*100:+.1f}%p·원정{adj[1]*100:+.1f}%p(표본 {adj[2]}·{adj[3]}경기)" if (adj[2] or adj[3]) else " / 누적 학습표본 없음(시장확률 그대로)"
+            adj_txt += f" / 해외축구 {model['cal_n']:,}경기 보정표 적용" if model.get("cal_n") else ""
+            why = (f"환수율 {payout:.1f}% 마진제거 → 홈 {ph*100:.1f}%"
+                   + (f" / 무 {px*100:.1f}%" if model["three"] else "") + f" / 원정 {pa*100:.1f}%" + adj_txt)
+            up = min(ph, pa) if pick != "무" else None
+            res[idx] = dict(pick=pick, score=score, prob=pp, label=confidence_label(pp, 3 if model["three"] else 2),
+                            why=why, upset=up)
+        elif bt == "H" and r["line"] is not None and model:
+            line = r["line"]
+            names = ["핸디승", "핸디무", "핸디패"] if three_row else ["핸디승", "핸디패"]
+            mk_pick, mk_p = max(zip(names, mk), key=lambda x: x[1])
+            model_p = _model_cover(sport, model, line, three_row)
+            if model_p:
+                blend = [0.5 * a + 0.5 * b for a, b in zip(mk, model_p)]
+                s = sum(blend); blend = [x / s for x in blend]
+            else:
+                blend = mk
+            pick, pp = max(zip(names, blend), key=lambda x: x[1])
+            score = _score_text(sport, model, "홈승" if blend[0] >= blend[-1] else "원정승")
+            gap = (model_p[0] - mk[0]) * 100 if model_p else 0
+            why = (f"핸디 {line:+g} 배당 마진제거 {names[0]} {mk[0]*100:.1f}%"
+                   + (f"/무 {mk[1]*100:.1f}%" if three_row else "") + f"/{names[-1]} {mk[-1]*100:.1f}%"
+                   + (f" · 일반배당 기반 모델 커버확률 {model_p[0]*100:.1f}% (차이 {gap:+.1f}%p, 둘을 50:50 합성)" if model_p else ""))
+            res[idx] = dict(pick=pick, score=score, prob=pp, label=confidence_label(pp, 3 if three_row else 2),
+                            why=why, upset=min(blend[0], blend[-1]))
+        elif bt == "U":
+            pu, po = mk[0], mk[-1]
+            pick, pp = ("언더", pu) if pu >= po else ("오버", po)
+            why = f"언더/오버 환수율 {payout:.1f}% 마진제거 → 언더 {pu*100:.1f}% / 오버 {po*100:.1f}% (기준 {r['line'] if r['line'] else '?'})"
+            sc = ""
+            if model and "lam" in model:
+                sc = f"기대 총득점 {sum(model['lam']):.1f}"
+            elif model and "mu" in model:
+                sc = f"기대 총점 {total:.0f}"
+            res[idx] = dict(pick=pick, score=sc or "-", prob=pp, label=confidence_label(pp, 2), why=why, upset=min(pu, po))
+        else:
+            pick, pp = ("승", mk[0]) if mk[0] >= mk[-1] else ("패", mk[-1])
+            res[idx] = dict(pick=pick, score="-", prob=pp, label=confidence_label(pp, 2),
+                            why=f"마진제거 확률 {mk[0]*100:.1f}% / {mk[-1]*100:.1f}%", upset=min(mk[0], mk[-1]))
+    return res
+
+
+def _score_text(sport, model, pick):
+    if sport in ("축구", "야구") and "lam" in model:
+        lh, la = model["lam"]
+        M = _score_matrix(lh, la)
+        best, bp = (0, 0), -1
+        for i in range(len(M)):
+            for j in range(len(M)):
+                ok = (pick == "홈승" and i > j) or (pick == "원정승" and i < j) or (pick == "무" and i == j)
+                if ok and M[i][j] > bp:
+                    best, bp = (i, j), M[i][j]
+        return f"{best[0]} : {best[1]}"
+    if sport == "농구" and "mu" in model:
+        t = model.get("total", DEFAULT_TOTAL["농구"])
+        mu = model["mu"]
+        h, a = round((t + mu) / 2), round((t - mu) / 2)
+        return f"{h} : {a}"
+    if sport == "배구" and "q" in model:
+        q = model["q"]
+        c = {"3:0": q**3, "3:1": 3 * q**3 * (1 - q), "3:2": 6 * q**3 * (1 - q) ** 2}
+        s = max(c, key=c.get)
+        return s if pick == "홈승" else s[::-1]
+    return "-"
+
+
+def _model_cover(sport, model, line, three):
+    """일반 배당에서 역산한 점수 분포로 '핸디 line 적용 시' 홈 승/무/패 확률"""
+    if sport in ("축구", "야구") and "lam" in model:
+        M = _score_matrix(*model["lam"])
+        w = d = l = 0.0
+        for i in range(len(M)):
+            for j in range(len(M)):
+                diff = i - j + line
+                if diff > 1e-9: w += M[i][j]
+                elif diff < -1e-9: l += M[i][j]
+                else: d += M[i][j]
+        return [w, d, l] if three else [w / (w + l), l / (w + l)]
+    if sport == "농구" and "mu" in model:
+        nd = NormalDist(model["mu"] + line, model["sig"])
+        w = 1 - nd.cdf(0)
+        return [w, 1 - w]
+    return None
+
+
+# ───────────────────── 화면용: 예측 테이블 만들기 ─────────────────────
+def build_predictions(df_all, target_df):
+    """target_df 의 모든 행에 대해 예측 (학습: df_all 중 이미 종료된 경기)"""
+    if target_df.empty:
+        return pd.DataFrame()
+    learn = df_all[pd.to_datetime(df_all.match_datetime) < now_kst()]
+    form = team_form(learn)
+    out = []
+    keys = ["match_datetime", "league", "home_team", "away_team"]
+    for _, g in target_df.groupby(keys, sort=False):
+        rows = g.to_dict("records")
+        preds = predict_game(rows, form)
+        for i, r in enumerate(rows):
+            out.append({**r, **{f"pred_{k}": v for k, v in preds[i].items()}})
+    res = pd.DataFrame(out)
+    return res.sort_values(["match_datetime", "game_no"]).reset_index(drop=True)
