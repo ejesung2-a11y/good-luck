@@ -54,7 +54,7 @@ def init_sports_db():
 def get_uploaded_files():
     with _conn() as c:
         return pd.read_sql("""SELECT u.source_file AS 파일명, u.round_label AS 회차, u.row_count AS 행수,
-            u.uploaded_at AS 업로드시각 FROM uploads u ORDER BY u.uploaded_at DESC""", c)
+            substr(u.uploaded_at,1,19) AS 업로드시각 FROM uploads u ORDER BY u.uploaded_at DESC""", c)
 
 
 def delete_file_from_db(source_file):
@@ -99,7 +99,7 @@ def stash_raw(source_file, raw_bytes):
 
 def save_matches(df, source_file, round_label, raw_bytes=None, saved_path=None):
     """같은 경기(시각+종목+유형+라인+팀)가 이미 있으면 '최근 업로드'로 덮어쓴다."""
-    ts = now_kst().strftime("%Y-%m-%d %H:%M:%S")
+    ts = now_kst().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]          # 밀리초까지 저장해 업로드 순서를 보존
     saved_path = saved_path or ""
     if raw_bytes is not None and not saved_path:
         stamp = now_kst().strftime("%Y%m%d_%H%M%S")
@@ -351,9 +351,50 @@ def _finalize(rows):
                               keep="last").reset_index(drop=True)
 
 
+def round_from_name(name):
+    """파일명에서 회차 추출: '2026년도 132회차.pdf' → '132회차'"""
+    m = re.search(r"(\d{1,4})\s*회\s*차", os.path.basename(name))
+    return f"{int(m.group(1))}회차" if m else ""
+
+
 def guess_round_label(text):
-    m = re.search(r"(\d{2,3})\s*회\s*차", text)
+    """본문에서 추정(파일명에 회차가 없을 때만). 머리말 '2026년도 137회차' 형태를 우선하고,
+    사이드바의 '승부식 136회차 마감' 같은 문구는 피한다."""
+    m = re.search(r"\d{4}\s*년도?\s*(\d{2,3})\s*회\s*차", text)
+    if m:
+        return f"{m.group(1)}회차"
+    m = re.search(r"(\d{2,3})\s*회\s*차\s*대상경기", text)
     return f"{m.group(1)}회차" if m else ""
+
+
+def resolve_round_labels(batch):
+    """batch: {source_file: 회차라벨}. 같은 회차 파일이 여러 개면 '132회차-1', '132회차-2' … 로 구분(업로드 순).
+    이미 저장된 같은 회차 파일도 함께 번호를 다시 매긴다. return {source_file: 최종라벨}"""
+    base_of = lambda lab: re.sub(r"-\d+$", "", lab or "미지정")
+    now_dt = now_kst()
+    with _conn() as c:
+        existing = {sf: (lab, ts) for sf, lab, ts in c.execute("SELECT source_file, round_label, uploaded_at FROM uploads")}
+    members = {}
+    for sf, (lab, ts) in existing.items():
+        if sf not in batch:
+            members.setdefault(base_of(lab), []).append((ts, sf))
+    for i, (sf, lab) in enumerate(batch.items()):
+        b = base_of(lab)
+        ts = existing[sf][1] if sf in existing and base_of(existing[sf][0]) == b else (now_dt + timedelta(milliseconds=i)).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]   # 올린 순서 유지
+        members.setdefault(b, []).append((ts, sf))
+    final = {}
+    with _conn() as c:
+        for b, lst in members.items():
+            lst.sort()
+            for i, (_, sf) in enumerate(lst, 1):
+                label = b if len(lst) == 1 else f"{b}-{i}"
+                if sf in batch:
+                    final[sf] = label
+                elif existing[sf][0] != label:
+                    c.execute("UPDATE uploads SET round_label=? WHERE source_file=?", (label, sf))
+                    c.execute("UPDATE matches SET round_label=? WHERE source_file=?", (label, sf))
+    _sync_db()
+    return final
 
 
 # ───────────────────── 확률 모델 ─────────────────────
@@ -476,6 +517,31 @@ def odds_ok(r):
     return 1.02 <= sum(1 / x for x in o) <= 1.45
 
 
+def _handicap_crosscheck(rows, sport, ph, px, pa, three):
+    """축구 핸디 ±1.0 의 '핸디무' 확률로 일반 승/패 확률을 교차검증.
+    H -1.0 : 핸디무 = 홈이 정확히 1점차로 이김(일반 홈승에 포함) → 홈승 = 핸디승 + 핸디무
+    H +1.0 : 핸디무 = 원정이 정확히 1점차로 이김(일반 원정승) → 원정승 = 핸디무 + 핸디패
+    핸디무 확률이 높다 = 1점차 승부 가능성이 크다 = 무승부가 아니라 한쪽이 이길 가능성이 크다."""
+    if sport != "축구" or not three:
+        return ph, px, pa, None
+    for r in rows:
+        if (r["bet_type"] == "H" and pd.notna(r["line"]) and abs(abs(r["line"]) - 1) < 1e-9
+                and pd.notna(r["oddsx"]) and has_odds(r) and odds_ok(r)):
+            w, d, l = devig([r["odds1"], r["oddsx"], r["odds2"]])
+            if r["line"] < 0:
+                ph_h, rest = w + d, l
+                px_h, pa_h = rest * px / (px + pa), rest * pa / (px + pa)
+                note = f"핸디{r['line']:+g} 교차확인: 핸디무 {d*100:.0f}% → 핸디시장이 보는 홈승 {ph_h*100:.0f}% (일반배당 {ph*100:.0f}%)"
+            else:
+                pa_h, rest = d + l, w
+                ph_h, px_h = rest * ph / (ph + px), rest * px / (ph + px)
+                note = f"핸디{r['line']:+g} 교차확인: 핸디무 {d*100:.0f}% → 핸디시장이 보는 원정승 {pa_h*100:.0f}% (일반배당 {pa*100:.0f}%)"
+            nb = [0.7 * a + 0.3 * b for a, b in zip((ph, px, pa), (ph_h, px_h, pa_h))]
+            t = sum(nb)
+            return nb[0] / t, nb[1] / t, nb[2] / t, note + " · 일반 70:핸디 30 반영"
+    return ph, px, pa, None
+
+
 def predict_game(rows, form):
     """rows: 같은 경기의 행들(일반/H/U/SUM). return {row_index: dict}"""
     base = next((r for r in rows if r["bet_type"] == "일반"), None)
@@ -490,6 +556,8 @@ def predict_game(rows, form):
         three = base["oddsx"] is not None and not pd.isna(base["oddsx"])
         p = devig([base["odds1"]] + ([base["oddsx"]] if three else []) + [base["odds2"]])
         ph, px, pa = (p[0], p[1], p[2]) if three else (p[0], 0.0, p[1])
+        ph_m, pa_m = ph, pa
+        ph, px, pa, hnote = _handicap_crosscheck(rows, sport, ph, px, pa, three)
         ah, n_h = _adj(form, home); aa, n_a = _adj(form, away)
         sb, n_s = _adj(form, f"__sport:{sport}", k=80, cap=0.03)       # 종목 전체의 '홈 유리/불리' 편향(표본 많이 쌓여야 반영)
         ah, aa = ah + sb, aa - sb
@@ -499,7 +567,7 @@ def predict_game(rows, form):
         cal_n = None
         if sport == "축구" and three:                    # 해외 축구 CSV 로 만든 보정표 적용(있을 때만)
             ph2, px, pa2, cal_n = football_calib.calibrate(ph2, px, pa2)
-        model = dict(cal_n=cal_n, total=total, ph=ph2, px=px, pa=pa2, ph0=ph, pa0=pa, three=three, adj=(ah, aa, n_h, n_a),
+        model = dict(cal_n=cal_n, total=total, ph=ph2, px=px, pa=pa2, ph0=ph_m, pa0=pa_m, hnote=hnote, three=three, adj=(ah, aa, n_h, n_a),
                      over=(1 / base["odds1"] + (1 / base["oddsx"] if three else 0) + 1 / base["odds2"]))
         if sport in ("축구", "야구"):
             lh, la = fit_poisson(ph2, px if three else None, pa2, total)
@@ -539,7 +607,8 @@ def predict_game(rows, form):
             adj = model["adj"]
             adj_txt = f" / 학습보정 홈{adj[0]*100:+.1f}%p·원정{adj[1]*100:+.1f}%p(표본 {adj[2]}·{adj[3]}경기)" if (adj[2] or adj[3]) else " / 누적 학습표본 없음(시장확률 그대로)"
             adj_txt += f" / 해외축구 {model['cal_n']:,}경기 보정표 적용" if model.get("cal_n") else ""
-            why = (f"환수율 {payout:.1f}% 마진제거 → 홈 {ph*100:.1f}%"
+            hn = f" / {model['hnote']}" if model.get("hnote") else ""
+            why = (hn[3:] + " / " if hn else "") + (f"환수율 {payout:.1f}% 마진제거 → 홈 {ph*100:.1f}%"
                    + (f" / 무 {px*100:.1f}%" if model["three"] else "") + f" / 원정 {pa*100:.1f}%" + adj_txt)
             up = min(ph, pa) if pick != "무" else None
             res[idx] = dict(pick=pick, score=score, prob=pp, label=confidence_label(pp, 3 if model["three"] else 2),
@@ -679,6 +748,111 @@ def _model_cover(sport, model, line, three):
     return None
 
 
+# ───────────────────── 저장된 과거 경기로 만드는 통계 ─────────────────────
+def history_table(df_all):
+    """끝난 경기(일반 행에 최종 스코어가 있는 경기)의 모든 행(일반/핸디/언더오버/승N패)에 실제 결과를 붙인 표"""
+    rows = []
+    if df_all.empty:
+        return pd.DataFrame()
+    keys = ["match_datetime", "league", "home_team", "away_team"]
+    for _, g in df_all.groupby(keys, sort=False):
+        base = g[g.bet_type == "일반"]
+        if base.empty or pd.isna(base.iloc[0]["home_score"]):
+            continue
+        hs, as_ = int(base.iloc[0]["home_score"]), int(base.iloc[0]["away_score"])
+        for r in g.to_dict("records"):
+            if not has_odds(r) or not odds_ok(r):
+                continue
+            act = _actual(r, hs, as_)
+            if act is None:
+                continue
+            rows.append(dict(sport=r["sport"], bet_type=r["bet_type"], line=r["line"], o1=r["odds1"], ox=r["oddsx"],
+                             o2=r["odds2"], actual=act))
+    return pd.DataFrame(rows)
+
+
+def similar_stats(hist, r):
+    """같은 종목·같은 유형(·같은 핸디라인)에서 배당이 비슷했던 과거 경기의 실제 결과 분포"""
+    if hist is None or hist.empty or not has_odds(r):
+        return 0, Counter()
+    h = hist[(hist.sport == r["sport"]) & (hist.bet_type == r["bet_type"])]
+    bt = r["bet_type"]
+    if h.empty:
+        return 0, Counter()
+    if (bt == "H" or is_margin_bet(bt)) and pd.notna(r["line"]):
+        h = h[(h.line - r["line"]).abs() < 1e-9]
+    elif bt == "U" and pd.notna(r["line"]):
+        h = h[(h.line - r["line"]).abs() <= max(0.5, 0.03 * r["line"])]
+    o1, o2 = r["odds1"], r["odds2"]
+    h = h[((h.o1 - o1).abs() <= max(0.06, 0.04 * o1)) & ((h.o2 - o2).abs() <= max(0.06, 0.04 * o2))]
+    if pd.notna(r["oddsx"]):
+        h = h[h.ox.notna() & ((h.ox - r["oddsx"]).abs() <= max(0.1, 0.05 * r["oddsx"]))]
+    return len(h), Counter(h.actual)
+
+
+def odds_winrate_table(hist):
+    """종목별 '일반 배당이 가리키는 홈승 확률' 구간 vs 실제 홈승률"""
+    if hist is None or hist.empty:
+        return pd.DataFrame()
+    h = hist[hist.bet_type == "일반"].copy()
+    if h.empty:
+        return pd.DataFrame()
+    def imp(r):
+        o = [r.o1] + ([r.ox] if pd.notna(r.ox) else []) + [r.o2]
+        return devig(o)[0]
+    h["implied"] = h.apply(imp, axis=1)
+    h["구간"] = pd.cut(h.implied, [0, .35, .5, .65, .8, 1.01], right=False).astype(str)
+    h["home"] = (h.actual == "홈승").astype(float)
+    t = h.groupby(["sport", "구간"]).agg(경기수=("home", "size"), 배당이_가리킨_홈승=("implied", "mean"), 실제_홈승률=("home", "mean")).reset_index()
+    for c in ("배당이_가리킨_홈승", "실제_홈승률"):
+        t[c] = (t[c] * 100).round(1).astype(str) + "%"
+    return t
+
+
+def handicap_winrate_table(hist):
+    """종목·핸디 라인별 핸디승/무/패 실제 비율"""
+    if hist is None or hist.empty:
+        return pd.DataFrame()
+    h = hist[hist.bet_type == "H"].copy()
+    if h.empty:
+        return pd.DataFrame()
+    g = h.groupby(["sport", "line"])
+    t = g.agg(경기수=("actual", "size"),
+              핸디승=("actual", lambda x: (x == "핸디승").mean()),
+              핸디무=("actual", lambda x: (x == "핸디무").mean()),
+              핸디패=("actual", lambda x: (x == "핸디패").mean())).reset_index().sort_values("경기수", ascending=False).head(40)
+    for c in ("핸디승", "핸디무", "핸디패"):
+        t[c] = (t[c] * 100).round(0).astype(int).astype(str) + "%"
+    return t.rename(columns={"line": "핸디라인"})
+
+
+def apply_history(res, hist):
+    """예측 결과 표에 '비슷한 배당의 과거 실제 결과'를 붙이고, 표본이 5경기 이상이면 확률을 소폭(±5%p) 보정"""
+    notes, probs, labels, whys = [], [], [], []
+    for _, r in res.iterrows():
+        p, note, why = r["pred_prob"], "", r["pred_why"]
+        if pd.notna(p) and r["pred_pick"] not in ("검수 필요", "배당 미발매", "예측 제외"):
+            n, cnt = similar_stats(hist, r)
+            if n >= 5:
+                rate = cnt.get(r["pred_pick"], 0) / n
+                adj = max(-0.05, min(0.05, (rate - p) * n / (n + 40)))
+                top = " · ".join(f"{k} {v*100/n:.0f}%" for k, v in cnt.most_common(3))
+                note = f"📚 과거 비슷한 배당 {n}경기: {top}"
+                p2 = p + adj
+                why += f" · 비슷한배당 보정 {adj*100:+.1f}%p"
+                p = p2
+            elif n > 0:
+                note = f"📚 비슷한 배당 과거 {n}경기뿐(표본 부족, 참고만)"
+            else:
+                note = "📚 비슷한 배당의 과거 기록 없음"
+        notes.append(note); probs.append(p); whys.append(why)
+        nway = 3 if (pd.notna(r["oddsx"]) or is_margin_bet(r["bet_type"])) else 2
+        labels.append(confidence_label(p, nway) if pd.notna(p) and note is not None and r["pred_label"] not in ("⚠️ 검수", "⏳ 대기", "⚪ 제외") else r["pred_label"])
+    res = res.copy()
+    res["pred_hist"], res["pred_prob"], res["pred_label"], res["pred_why"] = notes, probs, labels, whys
+    return res
+
+
 # ───────────────────── 화면용: 예측 테이블 만들기 ─────────────────────
 def build_predictions(df_all, target_df):
     """target_df 의 모든 행에 대해 예측 (학습: df_all 중 이미 종료된 경기)"""
@@ -693,8 +867,8 @@ def build_predictions(df_all, target_df):
         preds = predict_game(rows, form)
         for i, r in enumerate(rows):
             out.append({**r, **{f"pred_{k}": v for k, v in preds[i].items()}})
-    res = pd.DataFrame(out)
-    return res.sort_values(["match_datetime", "game_no"]).reset_index(drop=True)
+    res = pd.DataFrame(out).sort_values(["match_datetime", "game_no"]).reset_index(drop=True)
+    return apply_history(res, history_table(learn))
 
 
 

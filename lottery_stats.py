@@ -37,6 +37,36 @@ def _sync():
 
 
 # ───────────── 업로드 파싱 (CSV / 엑셀 / 붙여넣기 텍스트) ─────────────
+def _pdf_text(raw):
+    """인쇄(PDF 저장)한 파일의 글자. 글자 레이어가 없는 이미지형이면 OCR(부정확할 수 있음)."""
+    txt = ""
+    try:
+        from pypdf import PdfReader
+        txt = "\n".join((p.extract_text() or "") for p in PdfReader(io.BytesIO(raw)).pages)
+    except Exception:
+        pass
+    txt = re.sub(r"[\x00-\x08\x0b-\x1f\u00a0]", " ", txt)
+    if len(re.findall(r"\d", txt)) >= 30:
+        return txt, "PDF 텍스트"
+    import sports                                       # 이미지형 PDF → OCR
+    import pypdfium2 as pdfium
+    pdf = pdfium.PdfDocument(raw)
+    return sports._ocr_pages([pdf[i].render(scale=4).to_pil() for i in range(len(pdf))]), "OCR(이미지 PDF)"
+
+
+def _pdf_row_sets(raw):
+    """두 가지 방식으로 행을 만든다: (1) 줄 단위 (2) '1100회' 표시로 나눈 블록 단위(한 회차 정보가 여러 줄로 쪼개진 경우)"""
+    txt, method = _pdf_text(raw)
+    lines = [re.split(r"\s+", l.strip()) for l in txt.splitlines() if l.strip()]
+    marks = list(re.finditer(r"(\d{1,4})\s*회(?!\s*차)", txt))
+    blocks = []
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(txt)
+        seg = txt[m.start():end]
+        blocks.append([m.group(1)] + re.split(r"\s+", re.sub(r"^\d{1,4}\s*회", "", seg).strip()))
+    return lines, blocks, method
+
+
 def _rows_from_bytes(name, raw):
     n = name.lower()
     if n.endswith((".xlsx", ".xls")):
@@ -88,9 +118,18 @@ def _find_window(game, ints):
 
 
 def parse_upload(game, name, raw):
+    if name.lower().endswith(".pdf"):
+        lines, blocks, _ = _pdf_row_sets(raw)
+        a, b = _parse_rows(game, lines), _parse_rows(game, blocks)
+        best = a if len(a) >= len(b) else b
+        return list({r[0]: r for r in best}.values())       # 같은 회차 중복 제거
+    return _parse_rows(game, _rows_from_bytes(name, raw))
+
+
+def _parse_rows(game, rows):
     g = GAMES[game]
     recs = []
-    for row in _rows_from_bytes(name, raw):
+    for row in rows:
         if game == "pension":
             cells = [re.sub(r"(회|조)$", "", str(c).strip()) for c in row if c is not None]
             six = next((c for c in cells if re.fullmatch(r"\d{6}", c)), None)

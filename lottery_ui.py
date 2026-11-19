@@ -27,21 +27,26 @@ def upload_panel(game):
         sm = L.summary(draws)
         if sm:
             st.info(f"저장됨: {sm['n']}회차 ({sm['first']}~{sm['last']}회)" + (f" · ⚠️ 누락 {len(sm['missing'])}개 회차: {sm['missing'][:15]}{'…' if len(sm['missing']) > 15 else ''}" if sm["missing"] else " · 누락 없음 ✅"))
-        st.caption(FORMAT_HELP[game] + " · CSV / 엑셀(xlsx) / 표를 복사해 만든 txt 모두 가능 · 같은 회차는 최근 업로드로 덮어씁니다.")
-        up = st.file_uploader("파일 선택", type=["csv", "xlsx", "xls", "txt"], accept_multiple_files=True, key=f"up_{game}")
+        st.caption(FORMAT_HELP[game] + " · CSV / 엑셀(xlsx) / 인쇄해서 저장한 PDF / 표를 복사한 txt 모두 가능 · 같은 회차는 최근 업로드로 덮어씁니다.")
+        ver = st.session_state.get(f"lot_ver_{game}", 0)
+        up = st.file_uploader("파일 선택", type=["csv", "xlsx", "xls", "txt", "pdf"], accept_multiple_files=True, key=f"up_{game}_{ver}")
         if up and st.button("💾 읽어서 저장", key=f"sv_{game}", use_container_width=True):
-            tot = 0
+            tot, errs = 0, []
             for f in up:
                 raw = f.getvalue()
                 recs = L.parse_upload(game, f.name, raw)
                 if not recs:
-                    st.error(f"{f.name}: 읽힌 회차가 없습니다. 열 순서를 확인해 주세요.")
+                    errs.append(f"{f.name}: 읽힌 회차가 없습니다. 열 순서를 확인해 주세요.")
                     continue
                 tot += L.save_draws(game, recs, f.name)
                 L.save_raw_upload(game, f.name, raw)
+            if errs:
+                st.session_state["lot_err"] = errs
+            if up:
+                st.session_state[f"lot_ver_{game}"] = ver + 1   # 처리 끝 → 업로드 칸 비우기
             if tot:
                 st.session_state["lot_msg"] = f"{tot}회차 저장 완료" + (" · ☁️ R2 에 백업됨" if storage.enabled() and not storage._state["error"] else "")
-                st.rerun()
+            st.rerun()
         if draws and st.button("🗑️ 이 게임 데이터 전부 삭제", key=f"clr_{game}"):
             L.clear_game(game)
             st.rerun()
@@ -52,6 +57,8 @@ def render(game, mode="balanced", n_games=1, fixed=(), exclude=()):
     g = L.GAMES[game]
     st.markdown(f"<h2 style='text-align:center;color:white'>🎲 {g['name']}</h2>", unsafe_allow_html=True)
     draws = upload_panel(game)
+    for e in st.session_state.pop("lot_err", []):
+        st.error(e)
     if st.session_state.get("lot_msg"):
         st.success(st.session_state.pop("lot_msg"))
     if storage.enabled() and storage._state["error"]:
@@ -142,10 +149,12 @@ prefix = "quantum-lab/"''', language="toml")
                 st.error(f"가져오기 실패: {e}")
     st.caption("기본값은 xgabora/Club-Football-Match-Data(MIT 라이선스, 약 23만 경기, 배당+결과). 다른 CSV 주소도 가능합니다.")
     st.caption("또는 직접 받은 CSV 업로드 — GitHub(xgabora/Club-Football-Match-Data 등)·football-data.co.uk·FootyStats 에서 받은 CSV. 홈/무/원정 배당과 결과(H/D/A) 열이 있어야 합니다.")
-    f = st.file_uploader("CSV 업로드", type=["csv"], key="fb_csv")
+    fv = st.session_state.get("fb_ver", 0)
+    f = st.file_uploader("CSV 업로드", type=["csv"], key=f"fb_csv_{fv}")
     if f and st.button("📐 보정표 만들기", use_container_width=True):
         try:
             out = football_calib.build_from_csv(f.name, f.getvalue())
+            st.session_state["fb_ver"] = fv + 1
             st.success(f"{out['n']:,}경기로 보정표 생성 완료")
             st.rerun()
         except Exception as e:

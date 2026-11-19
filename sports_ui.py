@@ -10,10 +10,11 @@ LABEL_BORDER = {"강력": "#34d399", "유력": "#facc15", "낮음": "#fb923c", "
 
 def sidebar():
     st.sidebar.markdown("### 📄 배당 캡처 업로드")
+    ver = st.session_state.get("sp_up_ver", 0)           # 처리 후 이 번호를 올리면 업로드 칸이 새로 만들어져 비워진다
     files = st.sidebar.file_uploader("PDF / 이미지(PNG·JPG) — 여러 개 가능", type=["pdf", "png", "jpg", "jpeg"],
-                                     accept_multiple_files=True)
-    pasted = st.sidebar.text_area("또는 와이즈토토 표를 복사해서 붙여넣기 (가장 정확)", height=90)
-    round_in = st.sidebar.text_input("회차 이름 (예: 137회차)", value="")
+                                     accept_multiple_files=True, key=f"sp_files_{ver}")
+    pasted = st.sidebar.text_area("또는 와이즈토토 표를 복사해서 붙여넣기 (가장 정확)", height=90, key=f"sp_paste_{ver}")
+    round_in = st.sidebar.text_input("회차 이름 (비우면 파일명에서 자동 · 예: 137회차)", value="")
     if st.sidebar.button("🔍 읽기(파싱) 시작", use_container_width=True):
         st.session_state["pending"] = {}
         bar = st.sidebar.progress(0.0)
@@ -22,41 +23,55 @@ def sidebar():
             text, method = sports.file_to_text(f.name, raw, progress=bar.progress)
             st.session_state["pending"][f.name] = dict(
                 df=sports.parse_text(text), raw=raw, path=sports.stash_raw(f.name, raw), method=method,
-                round=round_in or sports.guess_round_label(text))
+                round=round_in or sports.round_from_name(f.name) or sports.guess_round_label(text))
         if pasted.strip():
             name = f"붙여넣기_{sports.now_kst():%Y%m%d_%H%M%S}.txt"
             st.session_state["pending"][name] = dict(
                 df=sports.parse_text(pasted), raw=pasted.encode(), path=sports.stash_raw(name, pasted.encode()), method="텍스트 붙여넣기",
                 round=round_in or sports.guess_round_label(pasted))
         bar.empty()
+        if files or pasted.strip():
+            st.session_state["sp_up_ver"] = ver + 1      # 읽기가 끝났으니 업로드 목록·붙여넣기 칸 비우기
+            st.rerun()
     st.sidebar.markdown("---")
     return st.sidebar.selectbox("종목", ["전체", "축구", "야구", "농구", "배구"])
 
 
 def pending_review():
     pend = st.session_state.get("pending") or {}
+    if st.session_state.get("save_msg"):
+        st.success(st.session_state.pop("save_msg"))
+    if not pend:
+        return
+    top = st.container()
+    edited, labels = {}, {}
     for name, p in list(pend.items()):
         df = p["df"]
-        with st.expander(f"📝 검수 후 저장: {name}  ({p['method']}, {len(df)}행)", expanded=True):
+        with st.expander(f"📝 {name}  ({p['method']}, {len(df)}행)", expanded=len(pend) == 1):
             if df.empty:
                 st.error("읽힌 경기가 없습니다. 텍스트 붙여넣기를 사용하거나 해상도가 높은 캡처를 올려 주세요.")
                 continue
-            bad = (~df.apply(lambda r: sports.odds_ok(r), axis=1)).sum()
+            bad = (~df.apply(lambda r: sports.odds_ok(r), axis=1) & df.odds1.notna() & (df.bet_type != "SUM")).sum()
             if p["method"].startswith("OCR"):
-                st.warning(f"OCR 은 숫자를 틀리게 읽을 수 있습니다. 배당이 비정상인 {bad}행은 예측에서 자동 제외됩니다. "
-                           "표에서 직접 고친 뒤 저장하세요.")
-            rl = st.text_input("회차", value=p["round"], key=f"rl_{name}")
-            edited = st.data_editor(df, num_rows="dynamic", use_container_width=True, key=f"ed_{name}", height=300)
-            c1, c2 = st.columns(2)
-            if c1.button("💾 저장(같은 경기는 최신으로 덮어쓰기)", key=f"sv_{name}", use_container_width=True):
-                sports.save_matches(edited, name, rl or "미지정", saved_path=p.get("path"))
-                del st.session_state["pending"][name]
-                st.rerun()
-            if c2.button("버리기", key=f"dc_{name}", use_container_width=True):
+                st.warning(f"OCR 은 숫자를 틀리게 읽을 수 있습니다. 배당이 비정상인 {bad}행은 예측에서 자동 제외됩니다. 표에서 직접 고친 뒤 저장하세요.")
+            labels[name] = st.text_input("회차 (파일명에서 자동 · 같은 회차가 여러 개면 저장 시 -1, -2 로 구분)", value=p["round"], key=f"rl_{name}")
+            edited[name] = st.data_editor(df, num_rows="dynamic", use_container_width=True, key=f"ed_{name}", height=300)
+    with top:
+        st.markdown(f"**읽은 파일 {len(pend)}개 · 합계 {sum(len(p['df']) for p in pend.values())}행** — 검수가 끝났으면 한 번에 저장하세요.")
+        c1, c2 = st.columns(2)
+        if c1.button(f"💾 {len(edited)}개 파일 일괄 저장 (같은 경기는 최신으로 덮어쓰기)", type="primary", use_container_width=True, disabled=not edited):
+            final = sports.resolve_round_labels({n: (labels[n] or "미지정") for n in edited})
+            for n, df_ in edited.items():
+                sports.save_matches(df_, n, final[n], saved_path=pend[n].get("path"))
+            st.session_state["pending"] = {}
+            st.session_state["save_msg"] = f"{len(edited)}개 파일 저장 완료 → " + ", ".join(f"{n} = {final[n]}" for n in edited)
+            st.rerun()
+        if c2.button("전체 버리기", use_container_width=True):
+            for n, p in pend.items():
                 if p.get("path") and os.path.exists(p["path"]):
                     os.remove(p["path"]); sports.storage.remove(sports._rel(p["path"]))
-                del st.session_state["pending"][name]
-                st.rerun()
+            st.session_state["pending"] = {}
+            st.rerun()
 
 
 def _card(g):
@@ -77,6 +92,8 @@ def _card(g):
         up = f" · 역배 가능 {r['pred_upset']*100:.0f}%" if pd.notna(r.get("pred_upset")) and r["pred_upset"] else ""
         st.markdown(f"**{tname}** · 배당 {odds} → **{r['pred_pick']}** ({prob}) {label} · 스코어 {r['pred_score']}{up}")
         st.caption("🔍 " + r["pred_why"])
+        if r.get("pred_hist"):
+            st.caption(r["pred_hist"])
 
 
 def render(selected_sport):
@@ -165,6 +182,17 @@ def render(selected_sport):
         if len(done):
             st.dataframe(done.groupby("sport").size().rename("끝난 경기 수").reset_index(), hide_index=True)
         st.caption("지난 회차 PDF를 올릴수록 팀별·종목별 보정이 쌓이고, 아래 점검의 표본이 늘어 신뢰도가 올라갑니다.")
+        if len(done):
+            hist = sports.history_table(df)
+            t_odds = sports.odds_winrate_table(hist)
+            if not t_odds.empty:
+                st.markdown("**① 배당이 가리킨 승률 vs 실제 승률 (일반, 홈승 기준)**")
+                st.dataframe(t_odds, hide_index=True, use_container_width=True)
+            t_h = sports.handicap_winrate_table(hist)
+            if not t_h.empty:
+                st.markdown("**② 핸디 라인별 실제 핸디승/무/패 비율**")
+                st.dataframe(t_h, hide_index=True, use_container_width=True)
+            st.caption("③ '같은 배당이었던 다른 경기의 승률'은 🎯 경기전 예측 카드마다 📚 줄로 표시됩니다(표본 5경기 이상이면 확률을 ±5%p 안에서 보정).")
         if len(done) >= 10 and st.button("🧪 과거 경기 적중률 점검 (그 경기 이전 데이터만으로 재예측)", use_container_width=True):
             with st.spinner("계산 중…"):
                 ev, ng = sports.evaluate_finished(df)
