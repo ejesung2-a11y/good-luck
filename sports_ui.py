@@ -1,4 +1,5 @@
 import os
+import html
 import streamlit as st
 import pandas as pd
 import sports
@@ -74,26 +75,54 @@ def pending_review():
             st.rerun()
 
 
+BAR_COLORS = ["#38bdf8", "#94a3b8", "#f87171"]
+
+
+def _bar(dist):
+    """승/무/패 확률 막대 (홈=파랑, 무=회색, 원정=빨강)"""
+    if not isinstance(dist, list) or not dist:
+        return ""
+    cols = [BAR_COLORS[0], BAR_COLORS[2]] if len(dist) == 2 else BAR_COLORS
+    segs = "".join(
+        f"<div style='width:{max(p, 0.001)*100:.1f}%;background:{c};color:#0f172a;font-size:10px;font-weight:bold;text-align:center;overflow:hidden;white-space:nowrap'>{html.escape(str(n))} {p*100:.0f}%</div>"
+        for (n, p), c in zip(dist, cols))
+    return f"<div style='display:flex;height:18px;border-radius:5px;overflow:hidden;margin:4px 0'>{segs}</div>"
+
+
+def _odds_txt(r):
+    out = []
+    for o, t in ((r["odds1"], r.get("trend1")), (r["oddsx"], r.get("trendx")), (r["odds2"], r.get("trend2"))):
+        if pd.notna(o):
+            arrow = "" if t is None or pd.isna(t) or int(t) == 0 else ("<span style='color:#38bdf8'>↓</span>" if int(t) < 0 else "<span style='color:#f87171'>↑</span>")
+            out.append(f"{o:g}{arrow}")
+    return " / ".join(out) or "미발매"
+
+
 def _card(g):
-    sport = g.iloc[0]["sport"]
-    color = BADGE.get(sport, "#475569")
     head = g.iloc[0]
-    st.markdown(f"""<div style="background:#1e293b;border:1px solid #334155;border-radius:12px;padding:12px;margin-bottom:6px">
-      <span style="background:{color};color:#fff;padding:2px 6px;border-radius:4px;font-size:11px">{sport} · {head['league']}</span>
+    color = BADGE.get(head["sport"], "#475569")
+    parts = [f"""<span style="background:{color};color:#fff;padding:2px 6px;border-radius:4px;font-size:11px">{head['sport']} · {html.escape(str(head['league']))}</span>
       <b style="color:#38bdf8;margin-left:6px">{head['match_datetime'][5:16]}</b>
-      <div style="font-size:16px;font-weight:bold;margin-top:6px">🏠 {head['home_team']} <span style="color:#64748b;font-size:12px">vs</span> {head['away_team']}</div></div>""",
-                unsafe_allow_html=True)
+      <div style="font-size:16px;font-weight:bold;margin:6px 0">🏠 {html.escape(str(head['home_team']))} <span style="color:#64748b;font-size:12px">vs</span> ✈️ {html.escape(str(head['away_team']))}</div>"""]
     for _, r in g.iterrows():
+        bt = r["bet_type"]
         tname = {"일반": "일반", "H": f"핸디 {r['line']:+g}" if pd.notna(r["line"]) else "핸디",
-                 "U": f"언더오버 {r['line']:g}" if pd.notna(r["line"]) else "언더오버", "SUM": "홀짝"}.get(r["bet_type"], r["bet_type"])  # 승N패 는 그대로 표시
-        label = r["pred_label"]
+                 "U": f"언더오버 {r['line']:g}" if pd.notna(r["line"]) else "언더오버", "SUM": "홀짝"}.get(bt, bt)
         prob = f"{r['pred_prob']*100:.0f}%" if pd.notna(r["pred_prob"]) else "-"
-        odds = " / ".join(f"{x:g}" for x in [r["odds1"], r["oddsx"], r["odds2"]] if pd.notna(x)) or "미발매"
-        up = f" · 역배 가능 {r['pred_upset']*100:.0f}%" if pd.notna(r.get("pred_upset")) and r["pred_upset"] else ""
-        st.markdown(f"**{tname}** · 배당 {odds} → **{r['pred_pick']}** ({prob}) {label} · 스코어 {r['pred_score']}{up}")
-        st.caption("🔍 " + r["pred_why"])
+        row = [f"<div style='border-top:1px solid #334155;padding-top:6px;margin-top:6px'><b>{tname}</b> · 배당 {_odds_txt(r)} → <b style='color:#facc15'>{html.escape(str(r['pred_pick']))}</b> ({prob}) {r['pred_label']} · 스코어 {html.escape(str(r['pred_score']))}</div>"]
+        row.append(_bar(r.get("pred_dist")))
+        chips = []
+        if r.get("pred_alt"): chips.append(f"대안 {r['pred_alt']}")
+        if r.get("pred_draw"): chips.append(r["pred_draw"])
+        if r.get("pred_upset_txt"): chips.append(r["pred_upset_txt"])
+        if r.get("pred_signal"): chips.append(r["pred_signal"])
+        if chips:
+            row.append(f"<div style='font-size:12px;color:#e2e8f0'>{' · '.join(html.escape(str(c)) for c in chips)}</div>")
+        row.append(f"<div style='font-size:11px;color:#94a3b8;margin-top:2px'>🔍 {html.escape(str(r['pred_why']))}</div>")
         if r.get("pred_hist"):
-            st.caption(r["pred_hist"])
+            row.append(f"<div style='font-size:11px;color:#a5b4fc'>{html.escape(str(r['pred_hist'])).replace(chr(10), '<br>')}</div>")
+        parts.append("".join(row))
+    st.markdown(f"<div style='background:#1e293b;border:1px solid #334155;border-radius:12px;padding:12px;margin-bottom:10px'>{''.join(parts)}</div>", unsafe_allow_html=True)
 
 
 TYPE_ORDER = {"일반": 0, "승": 1, "H": 2, "U": 3, "SUM": 4}
@@ -160,30 +189,68 @@ def render(selected_sport):
         st.error("☁️ R2 저장 오류: " + sports.storage._state["error"])
 
     df = sports.load_matches()
-    t1, t2, t3, t4, t5 = st.tabs(["🎯 경기전 예측", "📜 지난 경기", "📂 파일 관리", "💾 백업/복구", "📈 학습 현황"])
+    t1, tc, t2, t3, t4, t5 = st.tabs(["🎯 경기전 예측", "🧩 조합·이변", "📜 지난 경기", "📂 파일 관리", "💾 백업/복구", "📈 학습 현황"])
+
+    # 핸디·언더오버 행까지 함께 있어야 교차확인(핸디무→일반승/무)이 되므로, 전체 행으로 예측한 뒤 화면에서 걸러낸다
+    pr_all = pd.DataFrame()
+    if not df.empty:
+        up_all = df[pd.to_datetime(df.match_datetime) > now]
+        if selected_sport != "전체":
+            up_all = up_all[up_all.sport == selected_sport]
+        pr_all = sports.build_predictions(df, up_all)
 
     with t1:
         if df.empty:
             st.info("저장된 경기가 없습니다. 좌측에서 업로드하세요.")
         else:
-            dts = pd.to_datetime(df.match_datetime)
-            up = df[dts > now]
-            days = sorted({d.date() for d in pd.to_datetime(up.match_datetime)})
+            days = sorted({d.date() for d in pd.to_datetime(pr_all.match_datetime)}) if not pr_all.empty else []
             pick_day = st.selectbox("날짜", ["오늘 이후 전부"] + [d.strftime("%Y-%m-%d") for d in days])
-            if pick_day != "오늘 이후 전부":
-                up = up[up.match_datetime.str.startswith(pick_day)]
-            if selected_sport != "전체":
-                up = up[up.sport == selected_sport]
             bt = st.radio("유형", ["전체", "일반", "핸디(H)", "언더오버(U)"], horizontal=True)
-            up = up[{"전체": up.bet_type.notna(), "일반": up.bet_type == "일반", "핸디(H)": up.bet_type == "H",
-                     "언더오버(U)": up.bet_type == "U"}[bt]]
-            pr = sports.build_predictions(df, up)
-            st.caption(f"경기전 {pr[['match_datetime','home_team','away_team']].drop_duplicates().shape[0] if not pr.empty else 0}경기 · 누적 DB {len(df)}행")
+            pr = pr_all
+            if not pr.empty:
+                if pick_day != "오늘 이후 전부":
+                    pr = pr[pr.match_datetime.str.startswith(pick_day)]
+                pr = pr[{"전체": pr.bet_type.notna(), "일반": pr.bet_type == "일반", "핸디(H)": pr.bet_type == "H",
+                         "언더오버(U)": pr.bet_type == "U"}[bt]]
+            st.caption(f"경기전 {pr[['match_datetime','home_team','away_team']].drop_duplicates().shape[0] if not pr.empty else 0}경기 · 누적 DB {len(df)}행 · 🔵홈승 ⚪무 🔴원정승 · 배당 옆 ↓↑는 사이트 표시 변동")
             if pr.empty:
                 st.info("현재 시각 이후의 경기가 없습니다. 새 회차 캡처를 업로드하세요.")
             else:
                 for _, g in pr.groupby(["match_datetime", "league", "home_team", "away_team"], sort=False):
                     _card(g)
+
+    with tc:
+        if pr_all.empty:
+            st.info("경기전 데이터가 없습니다.")
+        else:
+            st.markdown("#### 🎲 이변(역배) 후보 · 일반 경기")
+            ge = pr_all[(pr_all.bet_type == "일반") & pr_all.pred_upset.notna() & pr_all.pred_dist.notna()].copy()
+            if not ge.empty:
+                ge["역배확률"] = (ge.pred_upset * 100).round(0).astype(int)
+                ge["무확률"] = ge.pred_dist.map(lambda d: round(dict(d).get("무", 0) * 100) if isinstance(d, list) and "무" in dict(d) else None)
+                ge["경기"] = ge.home_team + " vs " + ge.away_team
+                ge["예상"] = ge.pred_pick + " (" + (ge.pred_prob * 100).round(0).astype(int).astype(str) + "%)"
+                cols = ["match_datetime", "league", "경기", "예상", "역배확률", "무확률", "pred_upset_txt", "pred_signal"]
+                top = ge.sort_values("역배확률", ascending=False).head(10)[cols]
+                top.columns = ["시각", "리그", "경기", "예상", "역배%", "무%", "판정", "배당변동"]
+                st.dataframe(top, hide_index=True, use_container_width=True)
+            st.markdown("#### 🧩 조합 추천")
+            n_legs = st.slider("조합 경기 수", 2, 8, 4)
+            st.caption("한 경기에서는 한 가지 선택만, 서로 다른 경기로 구성합니다. 확률은 경기끼리 독립이라고 가정한 값이며, 기대환급 = 합산확률 × 합산배당 입니다.")
+            for stl, cfg in sports.STYLES.items():
+                c = sports.build_combos(pr_all, n_legs, stl)
+                with st.expander(f"{stl} — {cfg['desc']}", expanded=stl == "안전형"):
+                    if not c:
+                        st.info("조건에 맞는 경기가 부족합니다.")
+                        continue
+                    k1, k2, k3 = st.columns(3)
+                    k1.metric("합산 적중확률", f"{c['joint_p']*100:.1f}%")
+                    k2.metric("합산 배당", f"{c['joint_odds']:.2f}배")
+                    k3.metric("기대환급", f"{c['ev']*100:.0f}%")
+                    for l in c["legs"]:
+                        tn = {"일반": "일반", "H": f"핸디 {l['line']:+g}" if pd.notna(l["line"]) else "핸디", "U": f"언더오버 {l['line']:g}" if pd.notna(l["line"]) else "언더오버"}.get(l["bet_type"], l["bet_type"])
+                        st.markdown(f"- **{l['home_team']} vs {l['away_team']}** · {tn} → **{l['pred_pick']}** (배당 {l['_odds']:g}, 확률 {l['pred_prob']*100:.0f}%) {l['pred_label']}")
+            st.warning("기대환급이 100%를 넘는 조합은 드뭅니다. 이 프로그램의 확률은 배당과 과거 기록에서 나온 값이라 시장보다 크게 정확하다고 보장할 수 없습니다. 선수·감독 상태와 경기 환경은 반영하지 못합니다.")
 
     with t2:
         if df.empty:
@@ -261,7 +328,15 @@ def render(selected_sport):
             if not t_h.empty:
                 st.markdown("**② 핸디 라인별 실제 핸디승/무/패 비율**")
                 st.dataframe(t_h, hide_index=True, use_container_width=True)
-            st.caption("③ '같은 배당이었던 다른 경기의 승률'은 🎯 경기전 예측 카드마다 📚 줄로 표시됩니다(표본 5경기 이상이면 확률을 ±5%p 안에서 보정).")
+            t_p = sports.payout_table(hist)
+            if not t_p.empty:
+                st.markdown("**③ 환급률 구간별: 인기(낮은 배당) 쪽이 실제로 이긴 비율 vs 배당이 가리킨 확률**")
+                st.dataframe(t_p, hide_index=True, use_container_width=True)
+            t_t = sports.trend_table(hist)
+            if not t_t.empty:
+                st.markdown("**④ 사이트가 표시한 배당 변동(↓하락/↑상승)이 붙은 쪽의 실제 적중률**")
+                st.dataframe(t_t, hide_index=True, use_container_width=True)
+            st.caption("⑤ '같은 배당이었던 다른 경기의 승률'은 🎯 경기전 예측 카드마다 📚 줄로 표시됩니다(표본 5경기 이상이면 확률을 ±5%p 안에서 보정).")
         if len(done) >= 10 and st.button("🧪 과거 경기 적중률 점검 (그 경기 이전 데이터만으로 재예측)", use_container_width=True):
             with st.spinner("계산 중…"):
                 ev, ng = sports.evaluate_finished(df)
