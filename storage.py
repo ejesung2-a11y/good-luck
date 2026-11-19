@@ -96,6 +96,22 @@ def list_keys():
         tok = r["NextContinuationToken"]
 
 
+def push_all(force=False):
+    """로컬 data/ 의 모든 파일을 R2 로 올린다. force=False 면 R2 에 없는 파일만. 올린 개수 반환."""
+    c = _cfg()
+    if not c or not os.path.isdir(DATA_DIR):
+        return 0
+    have = set() if force else {k for k, _ in list_keys()}
+    n = 0
+    for root, _, files in os.walk(DATA_DIR):
+        for fn in files:
+            rel = os.path.relpath(os.path.join(root, fn), DATA_DIR).replace("\\", "/")
+            if rel.startswith("_") or rel in have:
+                continue
+            n += 1 if push(rel) else 0
+    return n
+
+
 def restore_once():
     """앱 시작 시 1회: 로컬에 없는 파일만 R2 에서 내려받는다."""
     if _state["restored"]:
@@ -114,6 +130,7 @@ def restore_once():
             body = cl.get_object(Bucket=c["bucket"], Key=_key(c, rel))["Body"].read()
             with open(dst, "wb") as f:
                 f.write(body)
+        push_all(force=False)            # 로컬에만 있는 파일(연결 전에 올린 데이터)도 R2 로 올려 둔다
     except Exception as e:
         _state["error"] = f"복원 실패: {e}"
 

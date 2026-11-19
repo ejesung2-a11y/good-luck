@@ -112,6 +112,8 @@ access_key_id = "R2 API 토큰의 Access Key ID"
 secret_access_key = "R2 API 토큰의 Secret"
 bucket = "ajin-info-files"
 prefix = "quantum-lab/"''', language="toml")
+    if ok and st.button("☁️ 지금 R2로 전체 동기화(덮어쓰기)", use_container_width=True):
+        st.success(f"{storage.push_all(force=True)}개 파일을 R2 에 올렸습니다.")
     if ok:
         keys = storage.list_keys()
         if keys:
