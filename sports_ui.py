@@ -256,11 +256,21 @@ def render(selected_sport):
     ver = _ver()
     df = _matches(ver)
     n_db = sports.data_version()[0]
-    with st.expander(f"🩺 데이터 진단 — DB {n_db}행 · 화면 {len(df)}행", expanded=(len(df) != n_db)):
+    with st.expander(f"🩺 데이터 진단 — DB {n_db}행 · 화면 {len(df)}행", expanded=(len(df) != n_db or df.empty)):
         if len(df) != n_db:
             st.error("DB 와 화면의 행수가 다릅니다(계산 결과가 낡았습니다). 아래 버튼으로 다시 계산하세요.")
         if df.empty:
             st.write("저장된 경기가 없습니다. 사이드바에서 PDF 를 올리고 '읽기' → '일괄 저장'을 눌러야 DB 에 들어갑니다.")
+            if sports.storage.enabled():
+                n_orig = sum(1 for rel, _ in sports.storage.list_keys() if re.fullmatch(r"uploads/\d{8}_\d{6}_[^/]+\.(pdf|png|jpe?g|txt)", rel, re.I))
+                if n_orig:
+                    st.info(f"☁️ R2 에 업로드 원본 {n_orig}개가 남아 있습니다. DB 만 비어 있다면 원본을 다시 읽어 복구할 수 있습니다(다시 올릴 필요 없음).")
+                    if st.button("♻️ R2 원본으로 DB 복구", type="primary", key="rebuild_sp"):
+                        bar = st.progress(0.0)
+                        ok, skipped, fail = sports.rebuild_from_storage(bar.progress)
+                        st.cache_data.clear()
+                        st.session_state["save_msg"] = f"복구 완료: {ok}개 파일 읽음" + (f" · 실패 {len(fail)}: {fail[:3]}" if fail else "")
+                        st.rerun()
         else:
             dts_ = pd.to_datetime(df.match_datetime, errors="coerce")
             fut = df[dts_ > now]

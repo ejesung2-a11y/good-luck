@@ -133,6 +133,16 @@ prefix = "quantum-lab/"''', language="toml")
         if keys:
             st.dataframe(pd.DataFrame(keys, columns=["파일(폴더 기준)", "크기(byte)"]), hide_index=True, use_container_width=True, height=200)
 
+    if ok:
+        st.markdown("### ♻️ R2 원본으로 데이터 복구")
+        st.caption("앱 DB 가 비었지만 R2 에 올려 둔 원본(토토 PDF, 로또·연금·파워볼 파일)이 남아 있을 때 다시 읽어 복구합니다. 다시 올릴 필요가 없습니다.")
+        if st.button("♻️ 토토 + 로또/연금/파워볼 전부 복구", use_container_width=True):
+            import sports
+            bar = st.progress(0.0)
+            n_ok, skipped, fail = sports.rebuild_from_storage(bar.progress)
+            lot = L.rebuild_from_storage()
+            st.cache_data.clear()
+            st.success(f"토토 {n_ok}개 파일 복구(이미 있던 {skipped}개 제외) · 로또 {lot['lotto']}회차 · 연금 {lot['pension']}회차 · 파워볼 {lot['powerball']}회차" + (f" · 실패 {len(fail)}: {fail[:3]}" if fail else ""))
     st.markdown("### ⚽ 해외 축구 과거 경기 CSV (배당 + 결과)")
     cal = football_calib.load()
     if cal:

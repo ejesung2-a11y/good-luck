@@ -26,6 +26,7 @@ def _conn():
 
 
 def init_db():
+    os.makedirs(DATA_DIR, exist_ok=True)
     storage.restore_once()
     with _conn() as c:
         c.execute("""CREATE TABLE IF NOT EXISTS draws(game TEXT, round INTEGER, nums TEXT, extra INTEGER,
@@ -306,3 +307,23 @@ def backtest(game, draws, mode, test_draws=200, games_per_draw=5, seed=7):
     md = sum(diffs) / N
     sd = (sum((d - md) ** 2 for d in diffs) / max(1, N - 1)) ** 0.5 or 1e-9
     return dict(rounds=N, games=N * games_per_draw, my_mean=sum(my_all) / N, rnd_mean=sum(rnd_all) / N, z=md / (sd / N ** 0.5))
+
+
+def rebuild_from_storage():
+    """DB 가 비었을 때: R2 의 uploads/<게임>/ 원본에서 당첨번호를 다시 읽어 복구(오래된 순으로 읽어 최신이 덮어씀)."""
+    init_db()
+    total = {}
+    for game in GAMES:
+        items = []
+        for rel, _ in storage.list_keys():
+            m = re.fullmatch(rf"uploads/{game}/(\d{{8}}_\d{{6}})_(.+)", rel)
+            if m:
+                items.append((m.group(1), m.group(2), rel))
+        n = 0
+        for _, name, rel in sorted(items):
+            path = storage.fetch(rel)
+            if path:
+                recs = parse_upload(game, name, open(path, "rb").read())
+                n += save_draws(game, recs, name) if recs else 0
+        total[game] = n
+    return total

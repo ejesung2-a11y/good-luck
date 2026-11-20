@@ -39,6 +39,7 @@ def _sync_db():
 
 
 def init_sports_db():
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
     storage.restore_once()
     with _conn() as c:
         c.execute("""CREATE TABLE IF NOT EXISTS uploads(
@@ -195,6 +196,8 @@ def reparse_saved(source_file=None):
         rows = c.execute(q, a).fetchall()
     ok, fail = 0, []
     for sf, lab, path in rows:
+        if path and not os.path.exists(path):
+            storage.fetch(_rel(path))                     # 로컬에 없으면 R2 에서 내려받는다(시작 시에는 큰 파일을 받지 않으므로)
         if not path or not os.path.exists(path):
             fail.append(f"{sf} (원본 없음)")
             continue
@@ -210,6 +213,44 @@ def reparse_saved(source_file=None):
         except Exception as e:
             fail.append(f"{sf} ({e})")
     return ok, fail
+
+
+def rebuild_from_storage(progress=None):
+    """DB 가 비었을 때: R2 의 uploads/ 에 보관된 원본(PDF·이미지·텍스트)을 다시 읽어 DB 를 복구한다.
+    같은 파일명이 여러 번 올라가 있으면 가장 최근 것만 쓰고, 이미 DB 에 있는 파일은 건너뛴다."""
+    init_sports_db()
+    found = {}
+    for rel, _ in storage.list_keys():
+        m = re.fullmatch(r"uploads/(\d{8}_\d{6})_(.+)", rel)          # 하위 폴더(uploads/lotto/…)는 제외 — 토토 원본만
+        if m and "/" not in m.group(2) and m.group(2).lower().endswith((".pdf", ".png", ".jpg", ".jpeg", ".txt")):
+            found[m.group(2)] = (m.group(1), rel)                      # 같은 이름은 최신 스탬프가 이김
+    with _conn() as c:
+        have = {r[0] for r in c.execute("SELECT source_file FROM uploads")}
+    todo = sorted(((st, name, rel) for name, (st, rel) in found.items() if name not in have), key=lambda x: x[0])
+    parsed, fail = {}, []
+    for i, (stamp, name, rel) in enumerate(todo):
+        try:
+            path = storage.fetch(rel)
+            if not path:
+                fail.append(f"{name} (다운로드 실패)")
+                continue
+            raw = open(path, "rb").read()
+            text, _ = file_to_text(path, raw)
+            df = parse_text(text, year=year_from_name(name))
+            if df.empty:
+                fail.append(f"{name} (읽힌 경기 없음)")
+                continue
+            parsed[name] = (df, make_round_label(name, text) or "미지정", path)
+        except Exception as e:
+            fail.append(f"{name} ({e})")
+        if progress:
+            progress((i + 1) / len(todo))
+    if parsed:
+        final = resolve_round_labels({n: v[1] for n, v in parsed.items()})
+        for n, (df, _, path) in parsed.items():
+            save_matches(df, n, final[n], saved_path=path, sync=False)
+        _sync_db()
+    return len(parsed), len(found) - len(todo), fail
 
 
 def file_to_text(name, raw, progress=None):

@@ -15,7 +15,7 @@ import os
 import streamlit as st
 
 DATA_DIR = "data"
-_state = {"restored": False, "error": ""}
+_state = {"restored": False, "restore_ok": False, "error": ""}
 
 
 def _cfg():
@@ -53,11 +53,20 @@ def _key(c, rel):
     return _prefix(c) + rel
 
 
+ESSENTIAL = (".db", ".json")          # 시작할 때 꼭 복원할 작은 파일(DB·보정표). 원본 PDF/CSV 는 필요할 때만 내려받는다.
+
+
 def push(rel):
-    """data/<rel> 파일을 R2 로 업로드. 실패해도 앱은 계속 동작(오류는 status 에 기록)."""
+    """data/<rel> 파일을 R2 로 업로드. 실패해도 앱은 계속 동작(오류는 status 에 기록).
+    안전장치: 시작 복원이 끝나지 않은 상태에서 DB/보정표를 올리면 R2 의 멀쩡한 데이터를 빈 파일로 덮어쓸 수 있으므로 막는다."""
     c = _cfg()
     if not c:
         return False
+    if rel.endswith(ESSENTIAL) and not _state.get("restore_ok"):
+        restore_once()
+        if not _state.get("restore_ok"):
+            _state["error"] = f"R2 복원이 끝나지 않아 {rel} 를 덮어쓰지 않았습니다(데이터 보호). 앱을 Reboot 해 주세요."
+            return False
     try:
         with open(os.path.join(DATA_DIR, rel), "rb") as f:
             _client(c).put_object(Bucket=c["bucket"], Key=_key(c, rel), Body=f.read())
@@ -65,6 +74,25 @@ def push(rel):
     except Exception as e:
         _state["error"] = f"업로드 실패({rel}): {e}"
         return False
+
+
+def fetch(rel):
+    """R2 의 data/<rel> 을 필요할 때 내려받아 로컬 경로를 돌려준다(이미 있으면 그대로)."""
+    dst = os.path.join(DATA_DIR, rel)
+    if os.path.exists(dst):
+        return dst
+    c = _cfg()
+    if not c:
+        return None
+    try:
+        body = _client(c).get_object(Bucket=c["bucket"], Key=_key(c, rel))["Body"].read()
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(dst, "wb") as f:
+            f.write(body)
+        return dst
+    except Exception as e:
+        _state["error"] = f"다운로드 실패({rel}): {e}"
+        return None
 
 
 def remove(rel):
@@ -113,25 +141,41 @@ def push_all(force=False):
 
 
 def restore_once():
-    """앱 시작 시 1회: 로컬에 없는 파일만 R2 에서 내려받는다."""
+    """앱 시작 시: DB·보정표(.db/.json)만 먼저 R2 에서 내려받는다. 로컬에 이미 있으면 건드리지 않는다.
+    (예전에는 모든 파일을 한꺼번에 받다가 중간에 실패하면 DB 가 빠진 채 시작될 수 있었다)
+    성공해야 restore_ok=True 가 되고, 실패하면 다음 실행에서 다시 시도한다."""
     if _state["restored"]:
         return
-    _state["restored"] = True
     c = _cfg()
     if not c:
+        _state["restored"] = True
         return
     try:
         cl = _client(c)
-        for rel, _ in list_keys():
-            dst = os.path.join(DATA_DIR, rel)
-            if rel.startswith("_") or os.path.exists(dst):
+        keys = list_keys()
+        failed = []
+        for rel, _ in sorted(keys, key=lambda k: (not k[0].endswith(ESSENTIAL), k[0])):
+            if not rel.endswith(ESSENTIAL) or rel.startswith("_"):
                 continue
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            body = cl.get_object(Bucket=c["bucket"], Key=_key(c, rel))["Body"].read()
-            with open(dst, "wb") as f:
-                f.write(body)
-        push_all(force=False)            # 로컬에만 있는 파일(연결 전에 올린 데이터)도 R2 로 올려 둔다
+            dst = os.path.join(DATA_DIR, rel)
+            if os.path.exists(dst):
+                continue
+            try:
+                body = cl.get_object(Bucket=c["bucket"], Key=_key(c, rel))["Body"].read()
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                with open(dst, "wb") as f:
+                    f.write(body)
+            except Exception as e:
+                failed.append(f"{rel}: {e}")
+        _state["restored"] = True
+        _state["restore_ok"] = not failed
+        if failed:
+            _state["error"] = "복원 실패: " + " | ".join(failed)
+        else:
+            _state["restore_ok"] = True
+            push_all(force=False)            # 로컬에만 있는 파일(R2 연결 전에 쌓인 데이터)을 R2 로 올려 둔다(R2 에 없는 것만)
     except Exception as e:
+        _state["restore_ok"] = False
         _state["error"] = f"복원 실패: {e}"
 
 
