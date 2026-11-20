@@ -126,37 +126,12 @@ access_key_id = "R2 API 토큰의 Access Key ID"
 secret_access_key = "R2 API 토큰의 Secret"
 bucket = "ajin-info-files"
 prefix = "quantum-lab/"''', language="toml")
-    # 진단: 로컬 DB 에 실제로 데이터가 있는지 / R2 에는 얼마나 있는지
-    import os
-    loc = {n: storage.db_rows(os.path.join(storage.DATA_DIR, n)) for n in ("sports_quantum.db", "lottery.db")}
-    st.caption("💽 이 서버의 로컬 DB 행 수: " + " · ".join(f"{n} {v:,}행" for n, v in loc.items()))
-    if storage._state["error"]:
-        st.error("☁️ " + storage._state["error"])
+    if ok and st.button("☁️ 지금 R2로 전체 동기화(덮어쓰기)", use_container_width=True):
+        st.success(f"{storage.push_all(force=True)}개 파일을 R2 에 올렸습니다.")
     if ok:
         keys = storage.list_keys()
-        remote_db = {k: s for k, s in keys if k.endswith(".db")}
-        if remote_db and loc["sports_quantum.db"] == 0 and "sports_quantum.db" in remote_db:
-            st.warning("R2 에는 토토 DB 가 있는데 이 서버의 DB 는 비어 있습니다. 아래 '복원' 버튼을 누르세요.")
-        c_a, c_b = st.columns(2)
-        if c_a.button("⬇️ R2 → 이 서버로 복원(덮어쓰기)", use_container_width=True):
-            n = storage.restore_all()
-            st.cache_data.clear()
-            if storage._state["error"]:
-                st.error(storage._state["error"])
-            else:
-                st.success(f"{n}개 파일을 R2 에서 내려받았습니다. 메뉴를 바꿔 확인해 보세요.")
-                st.rerun()
-        if c_b.button("⬆️ 이 서버 → R2 로 전체 동기화(덮어쓰기)", use_container_width=True):
-            st.warning("※ 이 서버의 DB 가 비어 있을 때 누르면 R2 의 DB 도 빈 것으로 덮어씁니다.") if loc["sports_quantum.db"] == 0 else None
-            if loc["sports_quantum.db"] or st.session_state.get("force_push_ok"):
-                st.success(f"{storage.push_all(force=True)}개 파일을 R2 에 올렸습니다.")
-            else:
-                st.session_state["force_push_ok"] = True
-                st.info("DB 가 비어 있어 중단했습니다. 정말 올리려면 한 번 더 누르세요.")
         if keys:
             st.dataframe(pd.DataFrame(keys, columns=["파일(폴더 기준)", "크기(byte)"]), hide_index=True, use_container_width=True, height=200)
-        else:
-            st.warning("R2 폴더에 파일이 하나도 없습니다. 예전 업로드가 R2 에 올라간 적이 없다는 뜻이면, 파일 관리에서 원본을 다시 올려야 합니다. (secrets 의 prefix 가 예전과 같은지도 확인하세요)")
 
     st.markdown("### ⚽ 해외 축구 과거 경기 CSV (배당 + 결과)")
     cal = football_calib.load()
