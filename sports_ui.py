@@ -1,4 +1,5 @@
 import os
+import re
 import html
 import streamlit as st
 import pandas as pd
@@ -23,13 +24,13 @@ def sidebar():
             raw = f.getvalue()
             text, method = sports.file_to_text(f.name, raw, progress=bar.progress)
             st.session_state["pending"][f.name] = dict(
-                df=sports.parse_text(text), raw=raw, path=sports.stash_raw(f.name, raw), method=method,
-                round=round_in or sports.round_from_name(f.name) or sports.guess_round_label(text))
+                df=sports.parse_text(text, year=sports.year_from_name(f.name)), raw=raw, path=sports.stash_raw(f.name, raw), method=method,
+                round=round_in or sports.make_round_label(f.name, text), header=sports.header_round(text))
         if pasted.strip():
             name = f"붙여넣기_{sports.now_kst():%Y%m%d_%H%M%S}.txt"
             st.session_state["pending"][name] = dict(
                 df=sports.parse_text(pasted), raw=pasted.encode(), path=sports.stash_raw(name, pasted.encode()), method="텍스트 붙여넣기",
-                round=round_in or sports.guess_round_label(pasted))
+                round=round_in or sports.guess_round_label(pasted), header=sports.header_round(pasted))
         bar.empty()
         if files or pasted.strip():
             st.session_state["sp_up_ver"] = ver + 1      # 읽기가 끝났으니 업로드 목록·붙여넣기 칸 비우기
@@ -55,6 +56,10 @@ def pending_review():
             bad = (~df.apply(lambda r: sports.odds_ok(r), axis=1) & df.odds1.notna() & (df.bet_type != "SUM")).sum()
             if p["method"].startswith("OCR"):
                 st.warning(f"OCR 은 숫자를 틀리게 읽을 수 있습니다. 배당이 비정상인 {bad}행은 예측에서 자동 제외됩니다. 표에서 직접 고친 뒤 저장하세요.")
+            hy, hn = p.get("header", (None, None))
+            m_ = re.search(r"(\d+)회차", p["round"] or "")
+            if hn and m_ and int(m_.group(1)) != hn:
+                st.warning(f"⚠️ 파일명/입력 회차({p['round']})와 PDF 본문 머리말({hy}년 {hn}회차)이 다릅니다. 회차 칸을 확인해 주세요.")
             labels[name] = st.text_input("회차 (파일명에서 자동 · 같은 회차가 여러 개면 저장 시 -1, -2 로 구분)", value=p["round"], key=f"rl_{name}")
             edited[name] = st.data_editor(df, num_rows="dynamic", use_container_width=True, key=f"ed_{name}", height=300)
     with top:
@@ -123,6 +128,19 @@ def _card(g):
             row.append(f"<div style='font-size:11px;color:#a5b4fc'>{html.escape(str(r['pred_hist'])).replace(chr(10), '<br>')}</div>")
         parts.append("".join(row))
     st.markdown(f"<div style='background:#1e293b;border:1px solid #334155;border-radius:12px;padding:12px;margin-bottom:10px'>{''.join(parts)}</div>", unsafe_allow_html=True)
+
+
+def _paginate(groups, key, default=20):
+    """카드가 수백 개일 때 한 화면에 N경기씩 나눠 보기(스크롤이 길어지는 문제 완화)"""
+    n = len(groups)
+    if n <= 10:
+        return groups
+    c1, c2 = st.columns(2)
+    per = c1.select_slider("한 번에 보기(경기 수)", [10, 20, 40, 80, 200], value=default, key=f"pp_{key}")
+    pages = max(1, -(-n // per))
+    opts = list(range(1, pages + 1))
+    page = c2.selectbox("페이지", opts, format_func=lambda i: f"{i} / {pages}  ({(i-1)*per+1}~{min(i*per, n)}경기)", key=f"pg_{key}_{per}")
+    return groups[(page - 1) * per: page * per]
 
 
 TYPE_ORDER = {"일반": 0, "승": 1, "H": 2, "U": 3, "SUM": 4}
@@ -216,7 +234,8 @@ def render(selected_sport):
             if pr.empty:
                 st.info("현재 시각 이후의 경기가 없습니다. 새 회차 캡처를 업로드하세요.")
             else:
-                for _, g in pr.groupby(["match_datetime", "league", "home_team", "away_team"], sort=False):
+                groups = [g for _, g in pr.groupby(["match_datetime", "league", "home_team", "away_team"], sort=False)]
+                for g in _paginate(groups, f"fut_{pick_day}_{bt}"):
                     _card(g)
 
     with tc:
@@ -262,14 +281,15 @@ def render(selected_sport):
                 key = st.selectbox("날짜 선택", ds)
                 sub = df[df.match_datetime.str.startswith(key)]
             else:
-                key = st.selectbox("회차 선택", sorted(df.round_label.dropna().unique(), reverse=True))
+                key = st.selectbox("회차 선택", sorted(df.round_label.dropna().unique(), key=sports.round_sort_key, reverse=True))
                 sub = df[df.round_label == key]
             if selected_sport != "전체":
                 sub = sub[sub.sport == selected_sport]
             keys = ["match_datetime", "league", "home_team", "away_team"]
             ngames = sub[keys].drop_duplicates().shape[0]
             st.caption(f"{ngames}경기 · 카드 안의 초록색 배당이 실제 결과입니다(최종 스코어가 있는 경기만).")
-            for _, g in sub.sort_values(["match_datetime", "game_no"]).groupby(keys, sort=False):
+            groups = [g for _, g in sub.sort_values(["match_datetime", "game_no"]).groupby(keys, sort=False)]
+            for g in _paginate(groups, f"past_{mode}_{key}"):
                 _past_card(g)
             with st.expander("📋 원본 표로 보기"):
                 st.dataframe(sub[["game_no", "match_datetime", "league", "bet_type", "line", "home_team", "away_team",

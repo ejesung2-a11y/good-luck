@@ -193,7 +193,7 @@ def reparse_saved(source_file=None):
         try:
             raw = open(path, "rb").read()
             text, _ = file_to_text(path, raw)
-            df = parse_text(text)
+            df = parse_text(text, year=year_from_name(sf))
             if df.empty:
                 fail.append(f"{sf} (읽힌 경기 없음)")
                 continue
@@ -279,10 +279,11 @@ def _parse_line_value(s, kind):
     return float(t)
 
 
-def parse_text(text, default_date=None):
+def parse_text(text, default_date=None, year=None):
     text = re.sub(r"[\x00-\x08\x0b-\x1f\u00a0]", " ", text)      # PDF 가 칸 사이에 넣는 제어문자 제거
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     rows, prev_dt = [], None
+    cur_year = year or detect_year(text) or (default_date or now_kst()).year     # 연도: 파일명/머리말 우선, 없으면 올해
     for ln in lines:
         toks = ln.split()
         di = next((i for i, t in enumerate(toks) if re.match(r"^\d{1,2}\.\d{2}", t)), None)
@@ -296,11 +297,16 @@ def parse_text(text, default_date=None):
             continue
         tm = re.sub(r"\D", "", toks[ti]).zfill(4)
         hh, mi = int(tm[:-2]), int(tm[-2:])
-        year = (default_date or now_kst()).year
         try:
-            dt = datetime(year, mo, dd, hh, mi)
+            dt = datetime(cur_year, mo, dd, hh, mi)
         except ValueError:
             dt = prev_dt                                 # OCR 오인식 → 직전 행 시각
+        if dt is not None and prev_dt is not None and (prev_dt - dt).days > 200:
+            cur_year += 1                                # 12월 → 1월로 넘어가는 회차
+            try:
+                dt = datetime(cur_year, mo, dd, hh, mi)
+            except ValueError:
+                dt = prev_dt
         if dt is None:
             continue
         if prev_dt and dt < prev_dt and (prev_dt - dt) < timedelta(days=2):
@@ -418,20 +424,61 @@ def _finalize(rows):
                               keep="last").reset_index(drop=True)
 
 
+def _num_from_name(name):
+    m = re.search(r"(\d{1,4})\s*회\s*차?", os.path.basename(name))
+    return int(m.group(1)) if m else None
+
+
+def year_from_name(name):
+    """파일명에서 연도: '2026년도', '2026년' → 2026"""
+    m = re.search(r"(20\d{2})\s*년", os.path.basename(name))
+    return int(m.group(1)) if m else None
+
+
+def header_round(text):
+    """본문 머리말(예: '2026년도 137회차')에서 (연도, 회차). 사이드바의 '승부식 136회차 마감' 등은 쓰지 않는다."""
+    m = re.search(r"(20\d{2})\s*년도?\s*(\d{2,3})\s*회\s*차", text)
+    return (int(m.group(1)), int(m.group(2))) if m else (None, None)
+
+
+def detect_year(text):
+    y, _ = header_round(text)
+    if y:
+        return y
+    m = re.search(r"(20\d{2})\s*년도", text)
+    return int(m.group(1)) if m else None
+
+
+def make_round_label(name, text=""):
+    """파일명이 무엇이든: 회차는 파일명 → 본문 머리말 순, 연도는 파일명 → 본문 머리말 순으로 찾아 '2026년 137회차' 로 만든다.
+    연도를 못 찾으면 '137회차'."""
+    hy, hn = header_round(text)
+    n = _num_from_name(name) or hn
+    if n is None:
+        m = re.search(r"(\d{2,3})\s*회\s*차\s*대상경기", text)
+        n = int(m.group(1)) if m else None
+    y = year_from_name(name) or hy or detect_year(text)
+    if n is None:
+        return ""
+    return f"{y}년 {n}회차" if y else f"{n}회차"
+
+
 def round_from_name(name):
-    """파일명에서 회차 추출: '2026년도 132회차.pdf' → '132회차'"""
-    m = re.search(r"(\d{1,4})\s*회\s*차", os.path.basename(name))
-    return f"{int(m.group(1))}회차" if m else ""
+    n = _num_from_name(name)
+    if n is None:
+        return ""
+    y = year_from_name(name)
+    return f"{y}년 {n}회차" if y else f"{n}회차"
 
 
 def guess_round_label(text):
-    """본문에서 추정(파일명에 회차가 없을 때만). 머리말 '2026년도 137회차' 형태를 우선하고,
-    사이드바의 '승부식 136회차 마감' 같은 문구는 피한다."""
-    m = re.search(r"\d{4}\s*년도?\s*(\d{2,3})\s*회\s*차", text)
-    if m:
-        return f"{m.group(1)}회차"
-    m = re.search(r"(\d{2,3})\s*회\s*차\s*대상경기", text)
-    return f"{m.group(1)}회차" if m else ""
+    return make_round_label("", text)
+
+
+def round_sort_key(label):
+    """'2026년 137회차-2' → (2026, 137, 2) 로 정렬(문자열 정렬이면 99회차가 137회차보다 크게 나오는 문제 방지)"""
+    m = re.match(r"(?:(\d{4})년\s*)?(\d+)회차(?:-(\d+))?", str(label))
+    return (int(m.group(1) or 0), int(m.group(2)), int(m.group(3) or 0)) if m else (0, -1, 0)
 
 
 def resolve_round_labels(batch):
