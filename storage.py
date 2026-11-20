@@ -112,27 +112,68 @@ def push_all(force=False):
     return n
 
 
-def restore_once():
-    """앱 시작 시 1회: 로컬에 없는 파일만 R2 에서 내려받는다."""
-    if _state["restored"]:
-        return
-    _state["restored"] = True
+def db_rows(path):
+    """sqlite 파일 안의 모든 표의 행 수 합계. 파일이 없거나 깨졌으면 0."""
+    import sqlite3
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return 0
+    try:
+        con = sqlite3.connect(path)
+        try:
+            tabs = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+            return sum(con.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0] for t in tabs)
+        finally:
+            con.close()
+    except Exception:
+        return 0
+
+
+def _download(cl, c, rel, dst):
+    """임시 파일로 받은 뒤 교체 → 도중에 끊겨도 반쪽짜리 파일이 남지 않는다."""
+    os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+    body = cl.get_object(Bucket=c["bucket"], Key=_key(c, rel))["Body"].read()
+    tmp = dst + ".part"
+    with open(tmp, "wb") as f:
+        f.write(body)
+    os.replace(tmp, dst)
+
+
+def restore_once(force=False):
+    """앱 시작 시 R2 에서 복원.
+    · 로컬에 없는 파일은 내려받는다.
+    · 로컬 .db 가 '비어 있는데' R2 쪽 .db 가 더 크면(= 재배포로 새로 만들어진 빈 DB) R2 것으로 교체한다.
+      (예전 코드는 '파일이 존재하기만 하면' 건너뛰어서, 빈 DB 가 먼저 생기면 영영 복원되지 않았다)
+    · 성공했을 때만 '완료'로 기록 → R2 가 잠깐 실패하거나 Secrets 가 늦게 잡혀도 다음 실행에서 다시 시도한다.
+    · force=True 면 R2 의 모든 파일로 로컬을 덮어쓴다(수동 복구용)."""
+    if _state["restored"] and not force:
+        return 0
     c = _cfg()
     if not c:
-        return
+        return 0                          # 설정이 없으면 '완료'로 치지 않는다 → 설정이 잡히면 다음 실행에서 시도
+    n = 0
     try:
         cl = _client(c)
-        for rel, _ in list_keys():
-            dst = os.path.join(DATA_DIR, rel)
-            if rel.startswith("_") or os.path.exists(dst):
+        for rel, size in list_keys():
+            if rel.startswith("_") or rel.endswith(".part"):
                 continue
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            body = cl.get_object(Bucket=c["bucket"], Key=_key(c, rel))["Body"].read()
-            with open(dst, "wb") as f:
-                f.write(body)
-        push_all(force=False)            # 로컬에만 있는 파일(연결 전에 올린 데이터)도 R2 로 올려 둔다
+            dst = os.path.join(DATA_DIR, rel)
+            need = force or not os.path.exists(dst)
+            if not need and rel.endswith(".db") and db_rows(dst) == 0 and size > os.path.getsize(dst):
+                need = True               # 빈 로컬 DB → R2 의 실제 DB 로 교체
+            if need:
+                _download(cl, c, rel, dst)
+                n += 1
+        _state["restored"] = True
+        _state["error"] = ""
+        push_all(force=False)             # 로컬에만 있는 파일(연결 전에 올린 데이터)도 R2 로 올려 둔다
     except Exception as e:
-        _state["error"] = f"복원 실패: {e}"
+        _state["error"] = f"복원 실패(다음 실행 때 다시 시도): {e}"
+    return n
+
+
+def restore_all():
+    """수동 복구: R2 의 모든 파일로 로컬을 덮어쓴다. 내려받은 파일 수 반환."""
+    return restore_once(force=True)
 
 
 def status():
