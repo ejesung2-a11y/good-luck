@@ -10,40 +10,6 @@ BADGE = {"축구": "#0284c7", "야구": "#16a34a", "농구": "#ea580c", "배구"
 LABEL_BORDER = {"강력": "#34d399", "유력": "#facc15", "낮음": "#fb923c", "위험": "#f87171"}
 
 
-def _ver():
-    """DB 파일 변경 시각 = 데이터 버전. 데이터가 바뀔 때만 무거운 계산을 다시 한다."""
-    return os.stat(sports.DB_PATH).st_mtime_ns if os.path.exists(sports.DB_PATH) else 0
-
-
-@st.cache_data(show_spinner=False, max_entries=3)
-def _matches(ver):
-    return sports.load_matches()
-
-
-@st.cache_data(show_spinner=False, max_entries=3)
-def _hist(ver):
-    return sports.history_table(_matches(ver))
-
-
-@st.cache_data(show_spinner="예측 계산 중…", max_entries=6)
-def _predictions(ver, sport, bucket):
-    """bucket = 10분 단위 시각. 같은 데이터·같은 10분 안에서는 다시 계산하지 않는다."""
-    m = _matches(ver)
-    if m.empty:
-        return pd.DataFrame()
-    up = m[pd.to_datetime(m.match_datetime) > sports.now_kst()]
-    if sport != "전체":
-        up = up[up.sport == sport]
-    return sports.build_predictions(m, up, hist=_hist(ver)) if not up.empty else pd.DataFrame()
-
-
-@st.cache_data(show_spinner=False, max_entries=3)
-def _learn_tables(ver):
-    h = _hist(ver)
-    return dict(odds=sports.odds_winrate_table(h), hand=sports.handicap_winrate_table(h),
-                payout=sports.payout_table(h), trend=sports.trend_table(h))
-
-
 def sidebar():
     st.sidebar.markdown("### 📄 배당 캡처 업로드")
     ver = st.session_state.get("sp_up_ver", 0)           # 처리 후 이 번호를 올리면 업로드 칸이 새로 만들어져 비워진다
@@ -90,14 +56,6 @@ def pending_review():
             bad = (~df.apply(lambda r: sports.odds_ok(r), axis=1) & df.odds1.notna() & (df.bet_type != "SUM")).sum()
             if p["method"].startswith("OCR"):
                 st.warning(f"OCR 은 숫자를 틀리게 읽을 수 있습니다. 배당이 비정상인 {bad}행은 예측에서 자동 제외됩니다. 표에서 직접 고친 뒤 저장하세요.")
-            dts = pd.to_datetime(df.match_datetime, errors="coerce").dropna()
-            if len(dts):
-                span = (dts.max() - dts.min()).days
-                ym = re.search(r"(\d{4})년", p["round"] or "")
-                bad_year = bool(ym) and int(ym.group(1)) != dts.min().year and not (dts.min().month >= 11 and dts.max().year == int(ym.group(1)) + 1)
-                st.caption(f"📅 경기 날짜 범위: {dts.min():%Y-%m-%d} ~ {dts.max():%Y-%m-%d} ({span}일)")
-                if span > 14 or bad_year:
-                    st.warning("⚠️ 경기 날짜 범위가 이상합니다(14일 초과 또는 회차 연도와 다름). 연도·월이 잘못 읽혔을 수 있으니 표의 match_datetime 을 확인하세요.")
             hy, hn = p.get("header", (None, None))
             m_ = re.search(r"(\d+)회차", p["round"] or "")
             if hn and m_ and int(m_.group(1)) != hn:
@@ -110,9 +68,7 @@ def pending_review():
         if c1.button(f"💾 {len(edited)}개 파일 일괄 저장 (같은 경기는 최신으로 덮어쓰기)", type="primary", use_container_width=True, disabled=not edited):
             final = sports.resolve_round_labels({n: (labels[n] or "미지정") for n in edited})
             for n, df_ in edited.items():
-                sports.save_matches(df_, n, final[n], saved_path=pend[n].get("path"), sync=False)
-            sports._sync_db()                      # R2 로는 마지막에 한 번만 올린다(파일 수만큼 반복하면 느림)
-            st.cache_data.clear()
+                sports.save_matches(df_, n, final[n], saved_path=pend[n].get("path"))
             st.session_state["pending"] = {}
             st.session_state["save_msg"] = f"{len(edited)}개 파일 저장 완료 → " + ", ".join(f"{n} = {final[n]}" for n in edited)
             st.rerun()
@@ -151,8 +107,7 @@ def _card(g):
     head = g.iloc[0]
     color = BADGE.get(head["sport"], "#475569")
     parts = [f"""<span style="background:{color};color:#fff;padding:2px 6px;border-radius:4px;font-size:11px">{head['sport']} · {html.escape(str(head['league']))}</span>
-      <b style="color:#38bdf8;margin-left:6px">{head['match_datetime'][:16]}</b>
-      <span style="font-size:10px;color:#64748b;margin-left:6px">📄 {html.escape(str(head.get('round_label', '')))}</span>
+      <b style="color:#38bdf8;margin-left:6px">{head['match_datetime'][5:16]}</b>
       <div style="font-size:16px;font-weight:bold;margin:6px 0">🏠 {html.escape(str(head['home_team']))} <span style="color:#64748b;font-size:12px">vs</span> ✈️ {html.escape(str(head['away_team']))}</div>"""]
     for _, r in g.iterrows():
         bt = r["bet_type"]
@@ -233,8 +188,7 @@ def _past_card(g):
                 f"<td style='padding:4px 6px;text-align:center;white-space:nowrap'>{res}</td></tr>")
     st.markdown(f"""<div style="background:#1e293b;border:1px solid #334155;border-radius:12px;padding:10px 12px;margin-bottom:10px">
       <span style="background:{color};color:#fff;padding:2px 6px;border-radius:4px;font-size:11px">{head['sport']} · {head['league']}</span>
-      <b style="color:#38bdf8;margin-left:6px">{head['match_datetime'][:16]}</b>{score_html}
-      <div style="font-size:10px;color:#64748b;margin-top:2px">📄 {html.escape(str(head.get('source_file', '')))} · {html.escape(str(head.get('round_label', '')))}</div>
+      <b style="color:#38bdf8;margin-left:6px">{head['match_datetime'][5:16]}</b>{score_html}
       <div style="font-size:16px;font-weight:bold;margin:6px 0">🏠 {head['home_team']} <span style="color:#64748b;font-size:12px">vs</span> ✈️ {head['away_team']}</div>
       <div style="overflow-x:auto"><table style="border-collapse:separate;border-spacing:4px 3px;width:100%"><tr style="color:#64748b;font-size:10px"><td>유형</td><td colspan="3" style="text-align:center">배당 (초록 = 실제 결과)</td><td style="text-align:center">결과</td></tr>{trs}</table></div></div>""",
                 unsafe_allow_html=True)
@@ -247,25 +201,23 @@ def render(selected_sport):
     st.markdown(f"<p style='text-align:center;color:#38bdf8;font-size:13px'>⏱️ 한국시간 기준 {now:%Y-%m-%d %H:%M}</p>",
                 unsafe_allow_html=True)
     if st.button("🔄 새로고침 (현재 시각 기준 경기전 다시 불러오기)", use_container_width=True):
-        st.cache_data.clear()
         st.rerun()
     pending_review()
     if sports.storage.enabled() and sports.storage._state["error"]:
         st.error("☁️ R2 저장 오류: " + sports.storage._state["error"])
 
-    ver = _ver()
-    df = _matches(ver)
-    SECTIONS = ["🎯 경기전 예측", "🧩 조합·이변", "📜 지난 경기", "📂 파일 관리", "💾 백업/복구", "📈 학습 현황"]
-    # 탭(st.tabs)은 모든 탭을 매번 계산하지만, 선택 메뉴는 고른 화면만 계산해서 훨씬 빠르다
-    section = st.radio("메뉴", SECTIONS, horizontal=True, label_visibility="collapsed", key="sp_section")
-    bucket = int(now.timestamp() // 600)
+    df = sports.load_matches()
+    t1, tc, t2, t3, t4, t5 = st.tabs(["🎯 경기전 예측", "🧩 조합·이변", "📜 지난 경기", "📂 파일 관리", "💾 백업/복구", "📈 학습 현황"])
 
-    def pr_all_fn():
-        # 핸디·언더오버 행까지 함께 있어야 교차확인(핸디무→일반승/무)이 되므로, 전체 행으로 예측(캐시)한 뒤 화면에서 걸러낸다
-        return _predictions(ver, selected_sport, bucket) if not df.empty else pd.DataFrame()
+    # 핸디·언더오버 행까지 함께 있어야 교차확인(핸디무→일반승/무)이 되므로, 전체 행으로 예측한 뒤 화면에서 걸러낸다
+    pr_all = pd.DataFrame()
+    if not df.empty:
+        up_all = df[pd.to_datetime(df.match_datetime) > now]
+        if selected_sport != "전체":
+            up_all = up_all[up_all.sport == selected_sport]
+        pr_all = sports.build_predictions(df, up_all)
 
-    if section == SECTIONS[0]:
-        pr_all = pr_all_fn()
+    with t1:
         if df.empty:
             st.info("저장된 경기가 없습니다. 좌측에서 업로드하세요.")
         else:
@@ -286,8 +238,7 @@ def render(selected_sport):
                 for g in _paginate(groups, f"fut_{pick_day}_{bt}"):
                     _card(g)
 
-    if section == SECTIONS[1]:
-        pr_all = pr_all_fn()
+    with tc:
         if pr_all.empty:
             st.info("경기전 데이터가 없습니다.")
         else:
@@ -320,7 +271,7 @@ def render(selected_sport):
                         st.markdown(f"- **{l['home_team']} vs {l['away_team']}** · {tn} → **{l['pred_pick']}** (배당 {l['_odds']:g}, 확률 {l['pred_prob']*100:.0f}%) {l['pred_label']}")
             st.warning("기대환급이 100%를 넘는 조합은 드뭅니다. 이 프로그램의 확률은 배당과 과거 기록에서 나온 값이라 시장보다 크게 정확하다고 보장할 수 없습니다. 선수·감독 상태와 경기 환경은 반영하지 못합니다.")
 
-    if section == SECTIONS[2]:
+    with t2:
         if df.empty:
             st.info("데이터 없음")
         else:
@@ -345,7 +296,7 @@ def render(selected_sport):
                                   "odds1", "oddsx", "odds2", "home_score", "away_score"]],
                              use_container_width=True, hide_index=True)
 
-    if section == SECTIONS[3]:
+    with t3:
         files = sports.get_uploaded_files()
         if files.empty:
             st.info("업로드된 파일이 없습니다.")
@@ -356,26 +307,22 @@ def render(selected_sport):
             r1, r2 = st.columns(2)
             if r1.button("🔄 선택 파일 다시 읽기", use_container_width=True):
                 ok, fail = sports.reparse_saved(sel)
-                st.cache_data.clear()
                 st.success(f"{ok}개 다시 읽기 완료") if ok else None
                 [st.error(f) for f in fail]
             if r2.button("🔄 전체 파일 다시 읽기", use_container_width=True):
                 with st.spinner("다시 읽는 중…"):
                     ok, fail = sports.reparse_saved()
-                    st.cache_data.clear()
                 st.success(f"{ok}개 다시 읽기 완료") if ok else None
                 [st.error(f) for f in fail]
 
             if st.button(f"🗑️ '{sel}' 삭제", type="primary"):
                 sports.delete_file_from_db(sel)
-                st.cache_data.clear()
                 st.rerun()
         if st.button("⚠️ 전체 초기화"):
             sports.clear_sports_db()
-            st.cache_data.clear()
             st.rerun()
 
-    if section == SECTIONS[4]:
+    with t4:
         st.write("Streamlit Cloud 는 앱이 재시작/재배포되면 저장 파일이 사라질 수 있습니다. 주기적으로 백업하세요.")
         st.download_button("⬇️ 백업 내려받기 (zip)", sports.export_backup(), "sports_backup.zip", "application/zip")
         up_zip = st.file_uploader("백업 zip 복구", type=["zip"], key="restore")
@@ -385,27 +332,27 @@ def render(selected_sport):
             st.rerun()
 
 
-    if section == SECTIONS[5]:
+    with t5:
         done = df[df.home_score.notna() & (df.bet_type == "일반")] if not df.empty else df
         st.write(f"**학습에 쓰이는 끝난 경기: {len(done)}경기** (경기 결과 스코어가 PDF에 있는 경기만)")
         if len(done):
             st.dataframe(done.groupby("sport").size().rename("끝난 경기 수").reset_index(), hide_index=True)
         st.caption("지난 회차 PDF를 올릴수록 팀별·종목별 보정이 쌓이고, 아래 점검의 표본이 늘어 신뢰도가 올라갑니다.")
         if len(done):
-            lt = _learn_tables(ver)
-            t_odds = lt["odds"]
+            hist = sports.history_table(df)
+            t_odds = sports.odds_winrate_table(hist)
             if not t_odds.empty:
                 st.markdown("**① 배당이 가리킨 승률 vs 실제 승률 (일반, 홈승 기준)**")
                 st.dataframe(t_odds, hide_index=True, use_container_width=True)
-            t_h = lt["hand"]
+            t_h = sports.handicap_winrate_table(hist)
             if not t_h.empty:
                 st.markdown("**② 핸디 라인별 실제 핸디승/무/패 비율**")
                 st.dataframe(t_h, hide_index=True, use_container_width=True)
-            t_p = lt["payout"]
+            t_p = sports.payout_table(hist)
             if not t_p.empty:
                 st.markdown("**③ 환급률 구간별: 인기(낮은 배당) 쪽이 실제로 이긴 비율 vs 배당이 가리킨 확률**")
                 st.dataframe(t_p, hide_index=True, use_container_width=True)
-            t_t = lt["trend"]
+            t_t = sports.trend_table(hist)
             if not t_t.empty:
                 st.markdown("**④ 사이트가 표시한 배당 변동(↓하락/↑상승)이 붙은 쪽의 실제 적중률**")
                 st.dataframe(t_t, hide_index=True, use_container_width=True)
