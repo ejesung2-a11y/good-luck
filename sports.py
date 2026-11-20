@@ -101,7 +101,7 @@ def stash_raw(source_file, raw_bytes):
     return p
 
 
-def save_matches(df, source_file, round_label, raw_bytes=None, saved_path=None):
+def save_matches(df, source_file, round_label, raw_bytes=None, saved_path=None, sync=True):
     """같은 경기(시각+종목+유형+라인+팀)가 이미 있으면 '최근 업로드'로 덮어쓴다."""
     ts = now_kst().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]          # 밀리초까지 저장해 업로드 순서를 보존
     saved_path = saved_path or ""
@@ -134,7 +134,8 @@ def save_matches(df, source_file, round_label, raw_bytes=None, saved_path=None):
                   (source_file, round_label, fhash, ts, saved_path, len(df)))
     if saved_path:
         storage.push(_rel(saved_path))
-    _sync_db()
+    if sync:
+        _sync_db()
 
 
 def _nz(v):
@@ -496,7 +497,7 @@ def resolve_round_labels(batch):
         b = base_of(lab)
         ts = existing[sf][1] if sf in existing and base_of(existing[sf][0]) == b else (now_dt + timedelta(milliseconds=i)).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]   # 올린 순서 유지
         members.setdefault(b, []).append((ts, sf))
-    final = {}
+    final, changed = {}, False
     with _conn() as c:
         for b, lst in members.items():
             lst.sort()
@@ -507,7 +508,9 @@ def resolve_round_labels(batch):
                 elif existing[sf][0] != label:
                     c.execute("UPDATE uploads SET round_label=? WHERE source_file=?", (label, sf))
                     c.execute("UPDATE matches SET round_label=? WHERE source_file=?", (label, sf))
-    _sync_db()
+                    changed = True
+    if changed:
+        _sync_db()
     return final
 
 
@@ -928,16 +931,18 @@ def _model_cover(sport, model, line, three):
 # ───────────────────── 저장된 과거 경기로 만드는 통계 ─────────────────────
 def history_table(df_all):
     """끝난 경기(일반 행에 최종 스코어가 있는 경기)의 모든 행에 실제 결과·환급률·배당변동을 붙인 표"""
-    rows = []
     if df_all.empty:
         return pd.DataFrame()
-    keys = ["match_datetime", "league", "home_team", "away_team"]
-    for _, g in df_all.groupby(keys, sort=False):
-        base = g[g.bet_type == "일반"]
-        if base.empty or pd.isna(base.iloc[0]["home_score"]):
+    games = {}
+    for r in df_all.to_dict("records"):                       # 한 번만 훑으며 경기별로 묶는다(느린 groupby/필터 반복 제거)
+        games.setdefault((r["match_datetime"], r["league"], r["home_team"], r["away_team"]), []).append(r)
+    rows = []
+    for g in games.values():
+        base = next((r for r in g if r["bet_type"] == "일반"), None)
+        if base is None or pd.isna(base["home_score"]):
             continue
-        hs, as_ = int(base.iloc[0]["home_score"]), int(base.iloc[0]["away_score"])
-        for r in g.to_dict("records"):
+        hs, as_ = int(base["home_score"]), int(base["away_score"])
+        for r in g:
             if not has_odds(r) or not odds_ok(r):
                 continue
             act = _actual(r, hs, as_)
@@ -1138,7 +1143,7 @@ def apply_history(res, hist):
     return res
 
 
-def build_predictions(df_all, target_df):
+def build_predictions(df_all, target_df, hist=None):
     """target_df 의 모든 행에 대해 예측 (학습: df_all 중 이미 종료된 경기)"""
     if target_df.empty:
         return pd.DataFrame()
@@ -1155,7 +1160,7 @@ def build_predictions(df_all, target_df):
     for c in ("pred_dist", "pred_alt", "pred_draw", "pred_upset_txt", "pred_signal", "pred_upset"):
         if c not in res.columns:
             res[c] = None
-    return apply_history(res, history_table(learn))
+    return apply_history(res, hist if hist is not None else history_table(learn))
 
 
 # ───────────────────── 조합 추천 ─────────────────────

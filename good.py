@@ -52,7 +52,7 @@ st.markdown("""
     ::-webkit-scrollbar-thumb { background: #94a3b8; border-radius: 8px; border: 3px solid #1e293b; }
     ::-webkit-scrollbar-thumb:hover { background: #cbd5e1; }
     /* 오른쪽 아래 맨위/맨아래 이동 버튼 */
-    .scroll-btns { position: fixed; right: 26px; bottom: 22px; z-index: 99999; display: flex; flex-direction: column; gap: 8px; }
+    .scroll-btns { position: fixed; right: 30px; bottom: 120px; z-index: 99999; display: flex; flex-direction: column; gap: 8px; }
     .scroll-btns a { background: #334155; color: #f8fafc !important; text-decoration: none !important; width: 40px; height: 40px;
         border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 18px; border: 1px solid #64748b;
         box-shadow: 0 2px 6px rgba(0,0,0,.4); }
