@@ -11,8 +11,8 @@ LABEL_BORDER = {"강력": "#34d399", "유력": "#facc15", "낮음": "#fb923c", "
 
 
 def _ver():
-    """DB 파일 변경 시각 = 데이터 버전. 데이터가 바뀔 때만 무거운 계산을 다시 한다."""
-    return os.stat(sports.DB_PATH).st_mtime_ns if os.path.exists(sports.DB_PATH) else 0
+    """데이터 버전(행수·마지막 저장시각·파일수). 데이터가 바뀔 때만 무거운 계산을 다시 한다."""
+    return "|".join(str(x) for x in sports.data_version())
 
 
 @st.cache_data(show_spinner=False, max_entries=3)
@@ -255,6 +255,28 @@ def render(selected_sport):
 
     ver = _ver()
     df = _matches(ver)
+    n_db = sports.data_version()[0]
+    with st.expander(f"🩺 데이터 진단 — DB {n_db}행 · 화면 {len(df)}행", expanded=(len(df) != n_db)):
+        if len(df) != n_db:
+            st.error("DB 와 화면의 행수가 다릅니다(계산 결과가 낡았습니다). 아래 버튼으로 다시 계산하세요.")
+        if df.empty:
+            st.write("저장된 경기가 없습니다. 사이드바에서 PDF 를 올리고 '읽기' → '일괄 저장'을 눌러야 DB 에 들어갑니다.")
+        else:
+            dts_ = pd.to_datetime(df.match_datetime, errors="coerce")
+            fut = df[dts_ > now]
+            fin = df[df.home_score.notna() & (df.bet_type == "일반")]
+            st.write(f"- 현재 한국시간: **{now:%Y-%m-%d %H:%M}**")
+            st.write(f"- 저장된 파일 {df.source_file.nunique()}개 · 경기 날짜 {dts_.min():%Y-%m-%d} ~ {dts_.max():%Y-%m-%d}")
+            st.write(f"- **아직 시작 안 한 경기(경기전 예측 대상): {fut[['match_datetime','home_team','away_team']].drop_duplicates().shape[0]}경기**")
+            st.write(f"- **결과(최종 스코어)가 있는 경기(학습 대상): {len(fin)}경기**")
+            if fut.empty:
+                st.warning("저장된 경기가 전부 현재 시각 이전입니다. 경기전 예측과 조합 화면은 비어 있는 것이 정상입니다. "
+                           "지난 경기는 📜 지난 경기, 통계는 📈 학습 현황에서 보시고, 경기전 예측을 원하면 아직 시작 안 한 경기가 있는 최신 회차 PDF 를 올려 주세요.")
+            if fin.empty:
+                st.warning("스코어가 있는 끝난 경기가 없어 학습 통계가 비어 있습니다. 지난 회차 PDF(결과가 표시된 것)를 올려야 학습됩니다.")
+        if st.button("🧹 캐시 비우고 다시 계산", key="diag_clear"):
+            st.cache_data.clear()
+            st.rerun()
     SECTIONS = ["🎯 경기전 예측", "🧩 조합·이변", "📜 지난 경기", "📂 파일 관리", "💾 백업/복구", "📈 학습 현황"]
     # 탭(st.tabs)은 모든 탭을 매번 계산하지만, 선택 메뉴는 고른 화면만 계산해서 훨씬 빠르다
     section = st.radio("메뉴", SECTIONS, horizontal=True, label_visibility="collapsed", key="sp_section")
@@ -280,7 +302,7 @@ def render(selected_sport):
                          "언더오버(U)": pr.bet_type == "U"}[bt]]
             st.caption(f"경기전 {pr[['match_datetime','home_team','away_team']].drop_duplicates().shape[0] if not pr.empty else 0}경기 · 누적 DB {len(df)}행 · 🔵홈승 ⚪무 🔴원정승 · 배당 옆 ↓↑는 사이트 표시 변동")
             if pr.empty:
-                st.info("현재 시각 이후의 경기가 없습니다. 새 회차 캡처를 업로드하세요.")
+                st.info("표시할 경기전 경기가 없습니다. 위의 '🩺 데이터 진단'에서 이유를 확인하세요(저장된 경기가 모두 지난 경기이거나, 선택한 날짜·종목·유형에 해당이 없을 수 있습니다).")
             else:
                 groups = [g for _, g in pr.groupby(["match_datetime", "league", "home_team", "away_team"], sort=False)]
                 for g in _paginate(groups, f"fut_{pick_day}_{bt}"):

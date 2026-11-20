@@ -55,6 +55,13 @@ def init_sports_db():
                 c.execute(f"ALTER TABLE matches ADD COLUMN {col} {typ}")
 
 
+def data_version():
+    """데이터 버전(경기 행수, 마지막 저장시각, 파일 수). 파일 시각 대신 DB 를 직접 조회해 캐시가 낡은 채 남지 않게 한다."""
+    init_sports_db()
+    with _conn() as c:
+        return c.execute("SELECT COUNT(*), COALESCE(MAX(uploaded_at), ''), (SELECT COUNT(*) FROM uploads) FROM matches").fetchone()
+
+
 def get_uploaded_files():
     with _conn() as c:
         return pd.read_sql("""SELECT u.source_file AS 파일명, u.round_label AS 회차, u.row_count AS 행수,
