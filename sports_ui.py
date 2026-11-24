@@ -140,16 +140,23 @@ def pending_review():
         st.markdown(f"**읽은 파일 {len(pend)}개 · 합계 {sum(len(p['df']) for p in pend.values())}행** — 검수가 끝났으면 한 번에 저장하세요.")
         if confirm and any(not v for v in confirm.values()):
             st.warning("OCR 로 읽은 파일은 각 파일의 '눈으로 확인했습니다' 체크 후에만 저장할 수 있습니다. (이미지 캡처 OCR 은 배당이 자주 틀립니다. 모바일에서는 '인쇄 → PDF 저장'을 쓰면 정확합니다.)")
+        st.caption("📌 저장 규칙: 아직 시작 안 한 경기는 **가장 최근 회차의 최신 업로드**로만 덮어씁니다. 결과가 확정됐거나 이미 시작한 경기, 더 최신 회차에 이미 있는 경기는 덮어쓰지 않고 참고·학습용으로 보존합니다(이미 시작한 경기에 결과가 담긴 파일이 오면 결과만 채웁니다).")
         c1, c2 = st.columns(2)
         if c1.button(f"💾 {len(edited)}개 파일 일괄 저장 (같은 경기는 최신으로 덮어쓰기)", type="primary", use_container_width=True,
                      disabled=(not edited) or any(not v for v in confirm.values())):
             final = sports.resolve_round_labels({n: (labels[n] or "미지정") for n in edited})
+            tot = {}
             for n, df_ in edited.items():
-                sports.save_matches(df_.drop(columns=["확인필요"], errors="ignore"), n, final[n], saved_path=pend[n].get("path"), sync=False)
+                st_ = sports.save_matches(df_.drop(columns=["확인필요"], errors="ignore"), n, final[n], saved_path=pend[n].get("path"), sync=False)
+                for k_, v_ in st_.items():
+                    tot[k_] = tot.get(k_, 0) + v_
             sports._sync_db()                      # R2 로는 마지막에 한 번만 올린다(파일 수만큼 반복하면 느림)
             st.cache_data.clear()
             st.session_state["pending"] = {}
-            st.session_state["save_msg"] = f"{len(edited)}개 파일 저장 완료 → " + ", ".join(f"{n} = {final[n]}" for n in edited)
+            kept = tot.get("보존(결과 확정)", 0) + tot.get("보존(이미 시작)", 0) + tot.get("보존(더 최신 회차)", 0)
+            st.session_state["save_msg"] = (f"{len(edited)}개 파일 저장 완료 → " + ", ".join(f"{n} = {final[n]}" for n in edited)
+                                            + f" | 신규 {tot.get('신규', 0)}줄 · 최신으로 갱신 {tot.get('갱신', 0)}줄 · 덮어쓰지 않고 보존 {kept}줄"
+                                            + (f" (결과 확정 {tot.get('보존(결과 확정)', 0)} · 이미 시작 {tot.get('보존(이미 시작)', 0)} · 더 최신 회차 {tot.get('보존(더 최신 회차)', 0)})" if kept else ""))
             st.rerun()
         if c2.button("전체 버리기", use_container_width=True):
             for n, p in pend.items():
