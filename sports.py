@@ -1033,8 +1033,9 @@ def predict_game(rows, form):
                    + (f" / 무 {px*100:.1f}%" if model["three"] else "") + f" / 원정 {pa*100:.1f}%" + adj_txt)
             up = min(ph, pa)
             tn = _trend_note(base, ph, pa)
+            smap = {n: _score_text(sport, model, n) for n, _ in opts}
             res[idx] = dict(pick=pick, score=score, prob=pp, label=confidence_label(pp, 3 if model["three"] else 2),
-                            why=why, upset=up, dist=opts, alt=alt,
+                            why=why, upset=up, dist=opts, alt=alt, score_map=smap,
                             draw=draw_level(px, ph, pa) if model["three"] else "", upset_txt=upset_level(up, ph, pa), signal=tn)
         elif bt == "H" and r["line"] is not None and model:
             line = r["line"]
@@ -1047,13 +1048,14 @@ def predict_game(rows, form):
             else:
                 blend = mk
             pick, pp = max(zip(names, blend), key=lambda x: x[1])
-            score = _score_text(sport, model, "홈승" if blend[0] >= blend[-1] else "원정승")
+            smap = {n: _best_score(sport, model, _cat_pred("H", line, n)) for n in names}
+            score = smap[pick]
             gap = (model_p[0] - mk[0]) * 100 if model_p else 0
             why = (f"핸디 {line:+g} 배당 마진제거 {names[0]} {mk[0]*100:.1f}%"
                    + (f"/무 {mk[1]*100:.1f}%" if three_row else "") + f"/{names[-1]} {mk[-1]*100:.1f}%"
                    + (f" · 일반배당 기반 모델 커버확률 {model_p[0]*100:.1f}% (차이 {gap:+.1f}%p, 둘을 50:50 합성)" if model_p else ""))
             res[idx] = dict(pick=pick, score=score, prob=pp, label=confidence_label(pp, 3 if three_row else 2),
-                            why=why, upset=min(blend[0], blend[-1]), dist=list(zip(names, blend)),
+                            why=why, upset=min(blend[0], blend[-1]), dist=list(zip(names, blend)), score_map=smap,
                             alt=next(f"{n} {p*100:.0f}%" for n, p in sorted(zip(names, blend), key=lambda x: -x[1]) if n != pick))
         elif bt == "U":
             pu, po = mk[0], mk[-1]
@@ -1071,6 +1073,48 @@ def predict_game(rows, form):
             res[idx] = dict(pick=pick, score="-", prob=pp, label=confidence_label(pp, 2),
                             why=f"마진제거 확률 {mk[0]*100:.1f}% / {mk[-1]*100:.1f}%", upset=min(mk[0], mk[-1]))
     return res
+
+
+def _cat_pred(bt, line, name):
+    """결과 이름 → '홈-원정 점수차(d)'가 그 결과에 해당하는지 판정하는 함수"""
+    if bt == "H":
+        return {"핸디승": lambda d: d + line > 1e-9, "핸디무": lambda d: abs(d + line) <= 1e-9, "핸디패": lambda d: d + line < -1e-9}[name]
+    if is_margin_bet(bt):
+        n = int(line)
+        return {"승": lambda d: d > n, "패": lambda d: d < -n}.get(name, lambda d: abs(d) <= n)
+    return {"홈승": lambda d: d > 0, "무": lambda d: d == 0, "원정승": lambda d: d < 0}[name]
+
+
+def _best_score(sport, model, pred):
+    """모델의 점수 분포에서 pred(점수차)를 만족하는 가장 그럴듯한 스코어. 모델이 없으면 '-'"""
+    if not model:
+        return "-"
+    if sport in ("축구", "야구") and "lam" in model:
+        M = _score_matrix(*model["lam"], n=16)
+        best, bp = (0, 0), -1
+        for i in range(16):
+            for j in range(16):
+                if sport == "야구" and i == j:
+                    continue
+                if pred(i - j) and M[i][j] > bp:
+                    best, bp = (i, j), M[i][j]
+        return f"{best[0]} : {best[1]}" if bp >= 0 else "-"
+    if sport == "농구" and "mu" in model:
+        cand = [m for m in range(-40, 41) if pred(m)]
+        if not cand:
+            return "-"
+        m = min(cand, key=lambda x: abs(x - model["mu"]))
+        T = model.get("total", DEFAULT_TOTAL["농구"])
+        return f"{round((T + m) / 2)} : {round((T - m) / 2)}"
+    return "-"
+
+
+def handicap_legend(line):
+    """핸디 정수 라인의 결과표(무엇이 핸디승/무/패인지)"""
+    k = int(abs(line))
+    if line < 0:
+        return f"핸디{line:+g} 결과표: 홈 {k+1}점차 이상 승=핸디승 · 홈 정확히 {k}점차 승=핸디무 · 그 외(홈이 {k}점차 미만으로 이기거나 무·패)=핸디패"
+    return f"핸디{line:+g} 결과표: 원정 {k+1}점차 이상 승=핸디패 · 원정 정확히 {k}점차 승=핸디무 · 그 외(홈 승·무, 원정 {k-1}점차 이하 승)=핸디승"
 
 
 def _margin_probs(sport, model, n):
@@ -1110,25 +1154,12 @@ def _predict_margin(r, model, sport, total, bt):
     else:
         bl = mk
     pick, pp = max(zip(names, bl), key=lambda x: x[1])
-    score = "-"
-    if model and sport == "농구" and "mu" in model:
-        mu = model["mu"]
-        m = max(mu, n + 1) if pick == "승" else (min(mu, -(n + 1)) if pick == "패" else max(-n, min(n, mu)))
-        score = f"{round((model['total'] + m) / 2)} : {round((model['total'] - m) / 2)}"
-    elif model and sport in ("축구", "야구") and "lam" in model:
-        M = _score_matrix(*model["lam"], n=16)
-        best, bp = (0, 0), -1
-        for i in range(16):
-            for j in range(16):
-                d = i - j
-                cat = "승" if d > n else ("패" if d < -n else str(n))
-                if cat == pick and not (sport == "야구" and d == 0) and M[i][j] > bp:
-                    best, bp = (i, j), M[i][j]
-        score = f"{best[0]} : {best[1]}"
+    smap = {nm: _best_score(sport, model, _cat_pred(bt, float(n), nm)) for nm in names}
+    score = smap[pick]
     why = (f"승{n}패 배당 마진제거 승 {mk[0]*100:.1f}% / {n} {mk[1]*100:.1f}% / 패 {mk[2]*100:.1f}%"
            + (f" · 일반배당 기반 점수분포 {mp[0]*100:.1f}/{mp[1]*100:.1f}/{mp[2]*100:.1f}% (50:50 합성)" if mp else " · 이 종목은 점수모델이 없어 시장확률만 사용"))
     return dict(pick=pick, score=score, prob=pp, label=confidence_label(pp, 3), why=why, upset=min(bl[0], bl[2]),
-                dist=list(zip(names, bl)), alt=next(f"{n} {p*100:.0f}%" for n, p in sorted(zip(names, bl), key=lambda x: -x[1]) if n != pick))
+                dist=list(zip(names, bl)), score_map=smap, alt=next(f"{n} {p*100:.0f}%" for n, p in sorted(zip(names, bl), key=lambda x: -x[1]) if n != pick))
 
 
 def _score_text(sport, model, pick):
@@ -1355,24 +1386,52 @@ def _selfcal_delta(table, grp, base_p):
     return 0.0, 0
 
 
+def _repick(dist, bt):
+    """보정이 끝난 확률 분포에서 '가장 높은 결과'를 예상으로(일반 3-way 는 무가 거의 같은 수준이면 무)"""
+    d = dict(dist)
+    pick = max(d, key=d.get)
+    if bt == "일반" and "무" in d:
+        ph, px, pa = d.get("홈승", 0.0), d["무"], d.get("원정승", 0.0)
+        if px >= max(ph, pa) - 0.015 and px >= 0.27:
+            pick = "무"
+    return pick, d[pick]
+
+
+def _norm(d):
+    t = sum(d.values())
+    return {k: v / t for k, v in d.items()} if t > 0 else d
+
+
 def apply_history(res, hist, selfcal=None):
-    """예측 표에 사용자의 과거 데이터 통계를 붙이고 확률을 보정한다.
-    ① 두 배당이 모두 비슷했던 경기의 결과(표본 5+ → 최대 ±5%p) ② 고른 쪽 배당대의 적중률(표본 8+ → 최대 ±3%p)
-    ③ 일반 경기는 '역배(이변)' 과거 비율로 이변 확률도 보정 ④ 앱의 과거 예측-실제 결과로 만든 자기보정(최대 ±4%p)
+    """예측 표에 사용자의 과거 데이터 통계를 붙이고 확률을 보정한다. 모든 결과(홈승·무·원정승, 핸디승·무·패 …)를
+    각자의 과거 실제 비율로 함께 보정한 뒤 예상(pick)·스코어·대안을 다시 고른다(막대와 예상이 어긋나지 않게).
+    ① 두 배당이 모두 비슷했던 경기의 결과(표본 5+ → 결과별 최대 ±5%p) ② 그 결과의 배당대 적중률(표본 8+ → 최대 ±3%p)
+    ③ 일반 경기는 '역배(이변)' 과거 비율로 이변 확률도 보정 ④ 앱의 과거 예측-실제 결과로 만든 자기보정(최대 ±4%p).
     과거 시즌은 가중치를 낮춰 반영(최신 1.0, 한 시즌 전 0.6, …)."""
-    cols = {k: [] for k in ("pred_hist", "pred_prob", "pred_base", "pred_label", "pred_why", "pred_dist", "pred_upset", "pred_upset_txt")}
+    keys = ("pred_hist", "pred_prob", "pred_base", "pred_label", "pred_why", "pred_dist", "pred_upset", "pred_upset_txt",
+            "pred_pick", "pred_score", "pred_alt", "pred_draw")
+    cols = {k: [] for k in keys}
     for _, r in res.iterrows():
-        p, why, lines = r["pred_prob"], r["pred_why"], []
+        pick0, p0 = r["pred_pick"], r["pred_prob"]
+        p, why, lines = p0, r["pred_why"], []
         dist, up, up_txt = r.get("pred_dist"), r.get("pred_upset"), r.get("pred_upset_txt")
-        base_p = p
-        if pd.notna(p) and r["pred_pick"] not in ("검수 필요", "배당 미발매", "예측 제외"):
-            pick = r["pred_pick"]
-            adj = 0.0
+        pick, score, alt, draw = pick0, r["pred_score"], r.get("pred_alt"), r.get("pred_draw")
+        base_p = p0
+        if pd.notna(p0) and pick0 not in ("검수 필요", "배당 미발매", "예측 제외") and isinstance(dist, list):
+            d0 = dict(dist)
             n, cnt, W = similar_stats(hist, r)
+            adjd = {}
+            for name, pv in d0.items():
+                adj = 0.0
+                if n >= 5 and W > 0:
+                    adj += max(-0.05, min(0.05, (cnt.get(name, 0) / W - pv) * W / (W + 40)))
+                nb, rb, od, Wb = band_stats(hist, r, name)
+                if nb >= 8 and Wb > 0:
+                    adj += max(-0.03, min(0.03, (rb - pv) * Wb / (Wb + 80)))
+                adjd[name] = max(0.005, pv + max(-0.06, min(0.06, adj)))
+            adjd = _norm(adjd)
+            dist = [(nm, adjd[nm]) for nm, _ in dist]
             if n >= 5 and W > 0:
-                rate = cnt.get(pick, 0) / W
-                a1 = max(-0.05, min(0.05, (rate - p) * W / (W + 40)))
-                adj += a1
                 top = " · ".join(f"{k} {v*100/W:.0f}%" for k, v in cnt.most_common(3))
                 lines.append(f"📚 같은 배당 조합(홈·상대 모두 비슷) {n}경기: {top}")
                 if r["bet_type"] == "일반" and pd.notna(up):
@@ -1384,34 +1443,42 @@ def apply_history(res, hist, selfcal=None):
                 lines.append(f"📚 같은 배당 조합 과거 {n}경기뿐 [표본 부족 - 참고용]")
             else:
                 lines.append("📚 같은 배당 조합의 과거 기록 없음")
+            pick, p = _repick(dist, r["bet_type"])
             nb, rb, od, Wb = band_stats(hist, r, pick)
             if nb >= 8 and Wb > 0:
-                a2 = max(-0.03, min(0.03, (rb - p) * Wb / (Wb + 80)))
-                adj += a2
                 lines.append(f"📊 이 배당대({od:g}±8%)에서 '{pick}' 실제 적중 {rb*100:.0f}% ({nb}경기)")
             elif nb > 0:
                 lines.append(f"📊 이 배당대 과거 {nb}경기뿐 [표본 부족 - 참고용]")
-            adj = max(-0.06, min(0.06, adj))
-            if adj:
-                why += f" · 과거데이터 보정 {adj*100:+.1f}%p"
-                p = p + adj
-                if isinstance(dist, list):
-                    dist = _renorm_dist(dist, pick, adj)
-            base_p = p                                           # 자기보정 '이전' 확률(예측 기록·보정표의 기준)
+            base_p = p                                              # 자기보정 '이전' 확률(예측 기록·보정표의 기준)
             sc, sn = _selfcal_delta(selfcal, type_group(r["bet_type"]), base_p)
             if sc:
+                dist = list(_renorm_dist(dist, pick, sc))
+                pick, p = _repick(dist, r["bet_type"])
                 why += f" · 앱 예측기록 자기보정 {sc*100:+.1f}%p(과거 {sn}건)"
-                p = p + sc
-                if isinstance(dist, list):
-                    dist = _renorm_dist(dist, pick, sc)
-            if r["bet_type"] == "일반" and pd.notna(up) and isinstance(dist, list):
-                ph = dict(dist).get("홈승", 0.0); pa = dict(dist).get("원정승", 0.0)
-                up_txt = upset_level(up, ph, pa)
+            delta = dict(dist)[pick] - d0.get(pick, dict(dist)[pick])
+            if abs(delta) >= 0.0005:
+                why += f" · 과거데이터 보정 {pick} {delta*100:+.1f}%p"
+            if pick != pick0:
+                why += f" · ⚠️ 과거 실제 결과를 반영하자 예상이 '{pick0}' → '{pick}' 로 바뀜"
+            smap = r.get("pred_score_map")
+            if isinstance(smap, dict) and pick in smap:
+                score = smap[pick]
+            ranked = sorted(dist, key=lambda x: -x[1])
+            alt = next((f"{n_} {p_*100:.0f}%" for n_, p_ in ranked if n_ != pick), alt)
+            if len(ranked) >= 2 and ranked[0][1] - ranked[1][1] < 0.03:
+                alt += f" (⚖️ 1·2위 차이 {(ranked[0][1] - ranked[1][1])*100:.0f}%p — 박빙, 단일 선택 비추천)"
+            dd = dict(dist)
+            if r["bet_type"] == "일반":
+                if "무" in dd:
+                    draw = draw_level(dd["무"], dd.get("홈승", 0), dd.get("원정승", 0))
+                if pd.notna(up):
+                    up_txt = upset_level(up, dd.get("홈승", 0), dd.get("원정승", 0))
         nway = 3 if (pd.notna(r["oddsx"]) or is_margin_bet(r["bet_type"])) else 2
         keep = r["pred_label"] in ("⚠️ 검수", "⏳ 대기", "⚪ 제외")
         cols["pred_hist"].append("\n".join(lines)); cols["pred_prob"].append(p); cols["pred_base"].append(base_p); cols["pred_why"].append(why)
         cols["pred_label"].append(r["pred_label"] if keep or pd.isna(p) else confidence_label(p, nway))
         cols["pred_dist"].append(dist); cols["pred_upset"].append(up); cols["pred_upset_txt"].append(up_txt)
+        cols["pred_pick"].append(pick); cols["pred_score"].append(score); cols["pred_alt"].append(alt); cols["pred_draw"].append(draw)
     res = res.copy()
     for k, v in cols.items():
         res[k] = v
@@ -1432,7 +1499,7 @@ def build_predictions(df_all, target_df, hist=None, selfcal=None):
         for i, r in enumerate(rows):
             out.append({**r, **{f"pred_{k}": v for k, v in preds[i].items()}})
     res = pd.DataFrame(out).sort_values(["match_datetime", "game_no"]).reset_index(drop=True)
-    for c in ("pred_dist", "pred_alt", "pred_draw", "pred_upset_txt", "pred_signal", "pred_upset"):
+    for c in ("pred_dist", "pred_alt", "pred_draw", "pred_upset_txt", "pred_signal", "pred_upset", "pred_score_map"):
         if c not in res.columns:
             res[c] = None
     return apply_history(res, hist if hist is not None else history_table(learn), selfcal)

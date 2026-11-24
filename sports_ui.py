@@ -159,6 +159,11 @@ def pending_review():
             st.rerun()
 
 
+def _ok(v):
+    """None / NaN / 빈 문자열이면 False (화면에 'nan' 이 찍히지 않게)"""
+    return isinstance(v, str) and v.strip() != "" and v.strip().lower() != "nan"
+
+
 BAR_COLORS = ["#38bdf8", "#94a3b8", "#f87171"]
 
 
@@ -210,14 +215,15 @@ def _card(g, notes=None):
         row = [f"<div style='border-top:1px solid #334155;padding-top:6px;margin-top:6px'><b>{tname}</b> · 배당 {_odds_txt(r)} → <b style='color:#facc15'>{html.escape(str(r['pred_pick']))}</b> ({prob}) {r['pred_label']} · 스코어 {html.escape(str(r['pred_score']))}</div>"]
         row.append(_bar(r.get("pred_dist")))
         chips = []
-        if r.get("pred_alt"): chips.append(f"대안 {r['pred_alt']}")
-        if r.get("pred_draw"): chips.append(r["pred_draw"])
-        if r.get("pred_upset_txt"): chips.append(r["pred_upset_txt"])
-        if r.get("pred_signal"): chips.append(r["pred_signal"])
+        if _ok(r.get("pred_alt")): chips.append(f"대안 {r['pred_alt']}")
+        for k_ in ("pred_draw", "pred_upset_txt", "pred_signal"):
+            if _ok(r.get(k_)): chips.append(r[k_])
         if chips:
             row.append(f"<div style='font-size:12px;color:#e2e8f0'>{' · '.join(html.escape(str(c)) for c in chips)}</div>")
         row.append(f"<div style='font-size:11px;color:#94a3b8;margin-top:2px'>🔍 {html.escape(str(r['pred_why']))}</div>")
-        if r.get("pred_hist"):
+        if bt in ("H", "hH") and pd.notna(r["line"]) and r["sport"] == "축구" and abs(r["line"] - round(r["line"])) < 1e-9 and abs(r["line"]) >= 1:
+            row.append(f"<div style='font-size:11px;color:#fde68a'>ℹ️ {html.escape(sports.handicap_legend(r['line']))}</div>")
+        if _ok(r.get("pred_hist")):
             row.append(f"<div style='font-size:11px;color:#a5b4fc'>{html.escape(str(r['pred_hist'])).replace(chr(10), '<br>')}</div>")
         parts.append("".join(row))
     st.markdown(f"<div style='background:#1e293b;border:1px solid #334155;border-radius:12px;padding:12px;margin-bottom:10px'>{''.join(parts)}</div>", unsafe_allow_html=True)
