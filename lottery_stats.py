@@ -41,11 +41,18 @@ def _sync():
 def _pdf_text(raw):
     """인쇄(PDF 저장)한 파일의 글자. 글자 레이어가 없는 이미지형이면 OCR(부정확할 수 있음)."""
     txt = ""
-    try:
-        from pypdf import PdfReader
-        txt = "\n".join((p.extract_text() or "") for p in PdfReader(io.BytesIO(raw)).pages)
+    try:                                                # pdfium 이 pypdf 보다 훨씬 빠름
+        import pypdfium2 as pdfium
+        d = pdfium.PdfDocument(raw)
+        txt = "\n".join(d[i].get_textpage().get_text_range() for i in range(len(d)))
     except Exception:
         pass
+    if len(re.findall(r"\d", txt)) < 30:
+        try:
+            from pypdf import PdfReader
+            txt = "\n".join((p.extract_text() or "") for p in PdfReader(io.BytesIO(raw)).pages)
+        except Exception:
+            pass
     txt = re.sub(r"[\x00-\x08\x0b-\x1f\u00a0]", " ", txt)
     if len(re.findall(r"\d", txt)) >= 30:
         return txt, "PDF 텍스트"
@@ -327,3 +334,72 @@ def rebuild_from_storage():
                 n += save_draws(game, recs, name) if recs else 0
         total[game] = n
     return total
+
+
+# ───────────── 직접 입력 (회차 + 당첨번호) ─────────────
+def parse_numbers(text):
+    return [int(x) for x in re.findall(r"\d+", str(text or ""))]
+
+
+def validate_draw(game, rd, nums, extra):
+    """입력값 검사. return 오류 문구 리스트(비어 있으면 정상)"""
+    errs = []
+    g = GAMES[game]
+    if rd is None or int(rd) < 1:
+        errs.append("회차는 1 이상이어야 합니다.")
+    if game == "pension":
+        if len(nums) != 6 or any(not 0 <= v <= 9 for v in nums):
+            errs.append("당첨번호는 0~9 숫자 6자리여야 합니다. (예: 482915)")
+        if extra is None or not 1 <= int(extra) <= 5:
+            errs.append("조는 1~5 중 하나여야 합니다.")
+        return errs
+    if len(nums) != g["k"] or len(set(nums)) != g["k"] or any(not g["lo"] <= v <= g["hi"] for v in nums):
+        errs.append(f"당첨번호는 서로 다른 {g['k']}개 숫자({g['lo']}~{g['hi']})여야 합니다.")
+    if game == "lotto":
+        if extra is None or not 1 <= int(extra) <= 45 or (extra in nums):
+            errs.append("보너스 번호는 1~45 이고 당첨번호와 겹치면 안 됩니다.")
+    if game == "powerball":
+        if extra is None or not 0 <= int(extra) <= 9:
+            errs.append("파워볼은 0~9 중 하나여야 합니다.")
+    return errs
+
+
+def add_draw(game, rd, nums, extra, source="직접입력"):
+    """회차 1건 저장(같은 회차가 있으면 덮어씀). return (오류 리스트, 덮어썼는지)"""
+    errs = validate_draw(game, rd, nums, extra)
+    if errs:
+        return errs, False
+    init_db()
+    with _conn() as c:
+        existed = c.execute("SELECT 1 FROM draws WHERE game=? AND round=?", (game, int(rd))).fetchone() is not None
+    nums = list(nums) if game == "pension" else sorted(nums)
+    save_draws(game, [(int(rd), nums, int(extra))], source)
+    return [], existed
+
+
+def delete_draw(game, rd):
+    init_db()
+    with _conn() as c:
+        c.execute("DELETE FROM draws WHERE game=? AND round=?", (game, int(rd)))
+    _sync()
+
+
+def reset_game(game, delete_originals=False):
+    """한 게임의 저장된 회차를 모두 지우고(R2 의 DB 에도 반영), 선택하면 업로드 원본도 삭제"""
+    init_db()
+    with _conn() as c:
+        n = c.execute("SELECT COUNT(*) FROM draws WHERE game=?", (game,)).fetchone()[0]
+        c.execute("DELETE FROM draws WHERE game=?", (game,))
+    removed = 0
+    if delete_originals:
+        d = os.path.join(DATA_DIR, "uploads", game)
+        if os.path.isdir(d):
+            for f in os.listdir(d):
+                try:
+                    os.remove(os.path.join(d, f))
+                except OSError:
+                    pass
+        rels = [rel for rel, _ in storage.list_keys() if rel.startswith(f"uploads/{game}/")] if storage.enabled() else []
+        removed = storage.remove_many(rels)
+    _sync()
+    return dict(draws=n, originals=removed)

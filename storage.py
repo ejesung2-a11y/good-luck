@@ -76,6 +76,23 @@ def push(rel):
         return False
 
 
+def remove_many(rels):
+    """R2 의 여러 파일을 한 번에 삭제(<prefix> 안의 파일만). 삭제된 개수를 돌려준다."""
+    c = _cfg()
+    if not c or not rels:
+        return 0
+    n = 0
+    try:
+        cl = _client(c)
+        for i in range(0, len(rels), 1000):
+            chunk = rels[i:i + 1000]
+            r = cl.delete_objects(Bucket=c["bucket"], Delete={"Objects": [{"Key": _key(c, x)} for x in chunk], "Quiet": True})
+            n += len(chunk) - len(r.get("Errors", []))
+    except Exception as e:
+        _state["error"] = f"삭제 실패: {e}"
+    return n
+
+
 def fetch(rel):
     """R2 의 data/<rel> 을 필요할 때 내려받아 로컬 경로를 돌려준다(이미 있으면 그대로)."""
     dst = os.path.join(DATA_DIR, rel)
