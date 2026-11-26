@@ -816,19 +816,28 @@ def devig(odds):
     return [p / t for p in ps]
 
 
+_FACT = None
+
+
 def _pois(k, lam):
     return math.exp(-lam) * lam ** k / math.factorial(k)
 
 
 def _score_matrix(lh, la, n=14):
-    return [[_pois(i, lh) * _pois(j, la) for j in range(n)] for i in range(n)]
+    """홈·원정 득점 푸아송 확률표 (numpy, n×n)"""
+    import numpy as np
+    global _FACT
+    if _FACT is None or len(_FACT) < 40:
+        _FACT = np.array([math.factorial(k) for k in range(40)], dtype=float)
+    k = np.arange(n)
+    ph = np.exp(-lh) * lh ** k / _FACT[:n]
+    pa = np.exp(-la) * la ** k / _FACT[:n]
+    return np.outer(ph, pa)
 
 
 def _outcome_probs(M):
-    ph = sum(M[i][j] for i in range(len(M)) for j in range(len(M)) if i > j)
-    pd_ = sum(M[i][i] for i in range(len(M)))
-    pa = sum(M[i][j] for i in range(len(M)) for j in range(len(M)) if i < j)
-    return ph, pd_, pa
+    import numpy as np
+    return float(np.tril(M, -1).sum()), float(np.trace(M)), float(np.triu(M, 1).sum())
 
 
 def fit_poisson(p_home, p_draw, p_away, total):
@@ -1184,6 +1193,9 @@ def predict_game(rows, form):
             pick, pp = ("승", mk[0]) if mk[0] >= mk[-1] else ("패", mk[-1])
             res[idx] = dict(pick=pick, score="-", prob=pp, label=confidence_label(pp, 2),
                             why=f"마진제거 확률 {mk[0]*100:.1f}% / {mk[-1]*100:.1f}%", upset=min(mk[0], mk[-1]))
+    lam_ = model.get("lam") if model else None                 # 점수 확률표(결합분포)를 만들 때 쓰는 득점 기대치
+    for k_ in res:
+        res[k_]["lam"] = lam_
     return res
 
 
@@ -1384,14 +1396,14 @@ def _side_col(i):
     return ("o1", "ox", "o2")[i]
 
 
-def similar_stats(hist, r):
+def similar_stats(hist, r, groups=None):
     """같은 종목·같은 유형(·같은 핸디라인)에서 '두 배당(홈·상대)이 모두 비슷했던' 과거 경기의 실제 결과 분포.
     return (경기수, {결과: 가중치합}, 가중치 총합)  — 최신 시즌 경기에 더 큰 가중치"""
     if hist is None or hist.empty or not has_odds(r):
         return 0, Counter(), 0.0
-    h = hist[(hist.sport == r["sport"]) & (hist.bet_type == r["bet_type"])]
+    h = groups.get((r["sport"], r["bet_type"])) if groups is not None else hist[(hist.sport == r["sport"]) & (hist.bet_type == r["bet_type"])]
     bt = r["bet_type"]
-    if h.empty:
+    if h is None or h.empty:
         return 0, Counter(), 0.0
     if (bt in ("H", "hH") or is_margin_bet(bt)) and pd.notna(r["line"]):
         h = h[(h.line - r["line"]).abs() < 1e-9]
@@ -1406,7 +1418,7 @@ def similar_stats(hist, r):
     return len(h), Counter(h.groupby("actual").w.sum().to_dict()), float(h.w.sum())
 
 
-def band_stats(hist, r, pick):
+def band_stats(hist, r, pick, groups=None):
     """'내가 고른 쪽의 배당대'(상대 배당은 무관)에서의 가중 적중률 — 표본이 더 넓다. return (경기수, 적중률, 배당, 가중치합)"""
     if hist is None or hist.empty or not has_odds(r):
         return 0, None, None, 0.0
@@ -1417,7 +1429,9 @@ def band_stats(hist, r, pick):
     od = (r["odds1"], r["oddsx"], r["odds2"])[i]
     if pd.isna(od):
         return 0, None, None, 0.0
-    h = hist[(hist.sport == r["sport"]) & (hist.bet_type == r["bet_type"])]
+    h = groups.get((r["sport"], r["bet_type"])) if groups is not None else hist[(hist.sport == r["sport"]) & (hist.bet_type == r["bet_type"])]
+    if h is None or h.empty:
+        return 0, None, od, 0.0
     if (r["bet_type"] in ("H", "hH") or is_margin_bet(r["bet_type"])) and pd.notna(r["line"]):
         h = h[(h.line - r["line"]).abs() < 1e-9]
     h = h[(h[_side_col(i)] - od).abs() <= max(0.05, 0.08 * od)]
@@ -1543,23 +1557,25 @@ def apply_history(res, hist, selfcal=None):
     ③ 일반 경기는 '역배(이변)' 과거 비율로 이변 확률도 보정 ④ 앱의 과거 예측-실제 결과로 만든 자기보정(최대 ±4%p).
     과거 시즌은 가중치를 낮춰 반영(최신 1.0, 한 시즌 전 0.6, …)."""
     keys = ("pred_hist", "pred_prob", "pred_base", "pred_label", "pred_why", "pred_dist", "pred_upset", "pred_upset_txt",
-            "pred_pick", "pred_score", "pred_alt", "pred_draw")
+            "pred_pick", "pred_score", "pred_alt", "pred_draw", "pred_sc")
     cols = {k: [] for k in keys}
+    groups = {k: v for k, v in hist.groupby(["sport", "bet_type"])} if hist is not None and not hist.empty else None
     for _, r in res.iterrows():
         pick0, p0 = r["pred_pick"], r["pred_prob"]
         p, why, lines = p0, r["pred_why"], []
         dist, up, up_txt = r.get("pred_dist"), r.get("pred_upset"), r.get("pred_upset_txt")
         pick, score, alt, draw = pick0, r["pred_score"], r.get("pred_alt"), r.get("pred_draw")
         base_p = p0
+        sc = 0.0
         if pd.notna(p0) and pick0 not in ("검수 필요", "배당 미발매", "예측 제외") and isinstance(dist, list):
             d0 = dict(dist)
-            n, cnt, W = similar_stats(hist, r)
+            n, cnt, W = similar_stats(hist, r, groups)
             adjd = {}
             for name, pv in d0.items():
                 adj = 0.0
                 if n >= 5 and W > 0:
                     adj += max(-0.05, min(0.05, (cnt.get(name, 0) / W - pv) * W / (W + 40)))
-                nb, rb, od, Wb = band_stats(hist, r, name)
+                nb, rb, od, Wb = band_stats(hist, r, name, groups)
                 if nb >= 8 and Wb > 0:
                     adj += max(-0.03, min(0.03, (rb - pv) * Wb / (Wb + 80)))
                 adjd[name] = max(0.005, pv + max(-0.06, min(0.06, adj)))
@@ -1578,7 +1594,7 @@ def apply_history(res, hist, selfcal=None):
             else:
                 lines.append("📚 같은 배당 조합의 과거 기록 없음")
             pick, p = _repick(dist, r["bet_type"])
-            nb, rb, od, Wb = band_stats(hist, r, pick)
+            nb, rb, od, Wb = band_stats(hist, r, pick, groups)
             if nb >= 8 and Wb > 0:
                 lines.append(f"📊 이 배당대({od:g}±8%)에서 '{pick}' 실제 적중 {rb*100:.0f}% ({nb}경기)")
             elif nb > 0:
@@ -1613,9 +1629,214 @@ def apply_history(res, hist, selfcal=None):
         cols["pred_label"].append(r["pred_label"] if keep or pd.isna(p) else confidence_label(p, nway))
         cols["pred_dist"].append(dist); cols["pred_upset"].append(up); cols["pred_upset_txt"].append(up_txt)
         cols["pred_pick"].append(pick); cols["pred_score"].append(score); cols["pred_alt"].append(alt); cols["pred_draw"].append(draw)
+        cols["pred_sc"].append(sc)
     res = res.copy()
     for k, v in cols.items():
         res[k] = v
+    return res
+
+
+# ───────────────────── 한 경기 전체를 하나의 스코어 확률표로 맞추기(일관성) ─────────────────────
+def recommend(dist, bt):
+    """결과 분포에서 '단일 추천 / 복수 추천 / 박빙 보류' 문구. 3지선다에서 방향이 약하면 1위 + 무(가운데 결과)를 묶는다."""
+    d = sorted(dist, key=lambda x: -x[1])
+    n1, p1 = d[0]
+    if len(d) == 2:
+        n2, p2 = d[1]
+        if p1 >= 0.55:
+            return f"단일 추천: {n1} ({p1*100:.0f}%)"
+        return f"⚖️ 박빙 — 단일 선택 보류 ({n1} {p1*100:.0f}% / {n2} {p2*100:.0f}%)"
+    names = [n for n, _ in dist]
+    mid, pm = names[1], dist[1][1]
+    n2, p2 = d[1]
+    if p1 >= 0.55 or (p1 >= 0.45 and p1 - p2 >= 0.15):
+        return f"단일 추천: {n1} ({p1*100:.0f}%)"
+    partner, pp = (n2, p2) if n1 == mid else (mid, pm)
+    return f"복수 추천: {n1} + {partner} (합 {(p1+pp)*100:.0f}%)" + (" · 방향성 약함" if p1 < 0.40 else "")
+
+
+def _row_partition(r, I, J):
+    """한 줄(일반·핸디·언더오버·승N패)을 '스코어 칸 → 결과 이름' 분할로 바꾼다. return (이름 순서, {이름: 불리언 마스크})"""
+    D, T = I - J, I + J
+    bt, line, d = r["bet_type"], r["line"], r["pred_dist"]
+    if not isinstance(d, list) or bt == "SUM" or bt in HALF_TYPES:
+        return None
+    names = [n for n, _ in d]
+    if bt == "U":
+        if pd.isna(line):
+            return None
+        return names, {"언더": T < line, "오버": T > line}
+    if bt == "H":
+        if pd.isna(line):
+            return None
+        return names, {n: _cat_pred("H", line, n)(D) for n in names}
+    if is_margin_bet(bt):
+        return names, {n: _cat_pred(bt, float(line), n)(D) for n in names}
+    if bt == "일반":
+        return names, {n: _cat_pred("일반", None, n)(D) for n in names}
+    return None
+
+
+def _joint(lam, sport, parts, n=16):
+    """푸아송 점수분포에서 출발해, 각 줄의 (보정된) 결과 확률에 맞도록 반복 비례조정(IPF)한 '한 경기의 스코어 확률표'.
+    일반·핸디·언더오버가 서로 모순되지 않는 하나의 분포가 된다. 줄끼리 어긋나는 부분은 절충(감쇠 0.6)한다."""
+    import numpy as np
+    M = np.array(_score_matrix(lam[0], lam[1], n), dtype=float)
+    if sport == "야구":
+        np.fill_diagonal(M, 0.0)
+    M /= M.sum()
+    for _ in range(60):
+        for masks, tgt in parts:
+            for lab, mask in masks.items():
+                cur, t = M[mask].sum(), tgt.get(lab)
+                if t is not None and cur > 1e-12:
+                    M[mask] *= (t / cur) ** 0.6
+            M /= M.sum()
+    return M
+
+
+def _tn(bt, line):
+    return {"일반": "일반", "H": f"핸디{line:+g}", "U": f"언더오버{line:g}"}.get(bt, bt if not is_margin_bet(bt) else f"승{int(line)}패")
+
+
+def coherence_pass(res):
+    """① 모든 줄에 단일/복수 추천 문구 ② 축구·야구는 한 경기를 하나의 스코어 확률표로 묶어
+    줄별 확률·예상·스코어를 서로 일관되게 다시 계산하고, 시나리오 표·연결 추천·모순 경고를 만든다."""
+    import numpy as np
+    if res.empty:
+        return res
+    res = res.copy().reset_index(drop=True)
+    n = len(res)
+    names_ = ("pred_dist", "pred_pick", "pred_prob", "pred_score", "pred_alt", "pred_draw", "pred_upset", "pred_upset_txt", "pred_label", "pred_base")
+    cols = {c: list(res[c]) for c in names_}
+    for c in ("pred_rec", "pred_summary", "pred_scen", "pred_conflict", "pred_link"):
+        cols[c] = [None] * n
+    NG = 16
+    I, J = np.indices((NG, NG))
+    for _, g in res.groupby(["match_datetime", "league", "home_team", "away_team"], sort=False):
+        pos = list(g.index)
+        for p in pos:
+            d = cols["pred_dist"][p]
+            if isinstance(d, list) and len(d) >= 2 and cols["pred_pick"][p] not in ("검수 필요", "배당 미발매", "예측 제외"):
+                cols["pred_rec"][p] = recommend(d, res.at[p, "bet_type"])
+        sport = res.at[pos[0], "sport"]
+        if sport not in ("축구", "야구"):
+            continue
+        lam = next((res.at[p, "pred_lam"] for p in pos if isinstance(res.at[p, "pred_lam"], (tuple, list))), None)
+        if lam is None:
+            continue
+        parts, meta = [], []
+        for p in pos:
+            r = res.loc[p].to_dict()
+            r["pred_dist"] = cols["pred_dist"][p]
+            rp = _row_partition(r, I, J)
+            if rp is None:
+                continue
+            nm, masks = rp
+            tot = sum(v for _, v in r["pred_dist"])
+            parts.append((masks, {k: v / tot for k, v in r["pred_dist"]}))
+            meta.append((p, r["bet_type"], r["line"], nm, masks))
+        if not any(m[1] == "일반" for m in meta):
+            continue
+        M = _joint(lam, sport, parts, NG)
+        E_tot = float((M * (I + J)).sum())
+
+        def mode(mask):
+            sub = np.where(mask, M, -1.0)
+            i, j = np.unravel_index(int(sub.argmax()), sub.shape)
+            return f"{i} : {j}", float(M[i, j])
+
+        # ── 줄별 재계산(모두 같은 스코어 확률표의 주변분포) ──
+        picks = {}
+        for p, bt, line, nm, masks in meta:
+            dist = [(k, float(M[masks[k]].sum())) for k in nm]
+            t = sum(v for _, v in dist)
+            dist = [(k, v / t) for k, v in dist]
+            old_pick = cols["pred_pick"][p]
+            pick, pp = _repick(dist, bt)
+            sc = res.at[p, "pred_sc"] if "pred_sc" in res.columns and pd.notna(res.at[p, "pred_sc"]) else 0.0
+            cols["pred_dist"][p], cols["pred_pick"][p], cols["pred_prob"][p] = dist, pick, pp
+            cols["pred_base"][p] = pp - (sc if pick == old_pick else 0.0)
+            cols["pred_label"][p] = confidence_label(pp, 3 if len(dist) == 3 else 2)
+            ranked = sorted(dist, key=lambda x: -x[1])
+            alt = next((f"{a} {b*100:.0f}%" for a, b in ranked if a != pick), None)
+            if len(ranked) >= 2 and ranked[0][1] - ranked[1][1] < 0.03 and alt:
+                alt += f" (⚖️ 1·2위 차이 {(ranked[0][1]-ranked[1][1])*100:.0f}%p — 박빙)"
+            cols["pred_alt"][p] = alt
+            sc_txt, _pb = mode(masks[pick])
+            cols["pred_score"][p] = f"{sc_txt} · 기대 총득점 {E_tot:.1f}" if bt == "U" else sc_txt
+            cols["pred_rec"][p] = recommend(dist, bt)
+            if bt == "일반":
+                dd = dict(dist)
+                if "무" in dd:
+                    cols["pred_draw"][p] = draw_level(dd["무"], dd.get("홈승", 0), dd.get("원정승", 0))
+                cols["pred_upset"][p] = min(dd.get("홈승", 0), dd.get("원정승", 0))
+                cols["pred_upset_txt"][p] = upset_level(cols["pred_upset"][p], dd.get("홈승", 0), dd.get("원정승", 0))
+            picks[p] = (bt, line, pick, masks)
+        # ── 모순 검사: 줄별 1위 추천이 동시에 성립할 확률 ──
+        allm = np.ones((NG, NG), dtype=bool)
+        for bt, line, pick, masks in picks.values():
+            allm &= masks[pick]
+        joint_hit = float(M[allm].sum())
+        # ── 시나리오 표(가장 그럴듯한 스코어 + 그 스코어에서 각 줄의 결과) ──
+        flat = np.argsort(-M, axis=None)[:6]
+        scen = []
+        for f in flat:
+            i, j = divmod(int(f), NG)
+            labs = []
+            for p, bt, line, nm, masks in meta:
+                for k in nm:
+                    if masks[k][i, j]:
+                        labs.append(f"{_tn(bt, line)} {k}")
+                        break
+            scen.append(dict(score=f"{i} : {j}", p=float(M[i, j]), labs=labs))
+        # ── 결과별 연결 시나리오: '일반이 이 결과라면 핸디·언더오버는?' ──
+        base = next(m for m in meta if m[1] == "일반")
+        others = [m for m in meta if m[1] != "일반"]
+        lines = []
+        rec_main = cols["pred_rec"][base[0]]
+        lines.append("📌 종합 의견: " + rec_main)
+        top_sc = " · ".join(f"{s['score']}({s['p']*100:.0f}%)" for s in scen[:4])
+        lines.append(f"🎯 가장 그럴듯한 스코어: {top_sc} · 기대 총득점 {E_tot:.1f}")
+        for k in base[3]:
+            mo = base[4][k]
+            po = float(M[mo].sum())
+            if po < 0.05:
+                continue
+            seg = [f"{k} {po*100:.0f}% → 대표 스코어 {mode(mo)[0]}"]
+            for p, bt, line, nm, masks in others:
+                cond = {kk: float(M[mo & masks[kk]].sum()) / max(po, 1e-12) for kk in nm}
+                bk = max(cond, key=cond.get)
+                seg.append(f"{_tn(bt, line)} {bk} {cond[bk]*100:.0f}%")
+            lines.append("   · " + " · ".join(seg))
+        # ── 연결 추천(일반 1위를 기준으로 핸디·언더오버를 그 안에서 고름) ──
+        top_o = cols["pred_pick"][base[0]]
+        cur = base[4][top_o].copy()
+        chain = [f"일반 {top_o}"]
+        for p, bt, line, nm, masks in sorted(others, key=lambda m: (m[1] != "H", abs(m[2]) if pd.notna(m[2]) else 0)):
+            best = max(nm, key=lambda kk: float(M[cur & masks[kk]].sum()))
+            if float(M[cur & masks[best]].sum()) > 1e-9:
+                cur &= masks[best]
+                chain.append(f"{_tn(bt, line)} {best}")
+        mo_top = base[4][top_o]                                   # 각 줄에 '일반 1위 결과라면' 기준의 조건부 추천을 붙인다
+        for p, bt, line, nm, masks in others:
+            den = float(M[mo_top].sum())
+            if den > 1e-9:
+                cond = {kk: float(M[mo_top & masks[kk]].sum()) / den for kk in nm}
+                bk = max(cond, key=cond.get)
+                cols["pred_link"][p] = f"일반 {top_o}이라면 → {bk} (조건부 {cond[bk]*100:.0f}%)"
+        lines.append(f"🔗 연결 추천(서로 모순 없는 조합): {' → '.join(chain)} · 동시 적중확률 {float(M[cur].sum())*100:.0f}% · 대표 스코어 {mode(cur)[0]}")
+        conflict = None
+        if joint_hit < 0.03 and len(picks) >= 2:
+            conflict = (f"⚠️ 줄별 1위 추천은 서로 동시에 성립하기 어렵습니다(동시 적중확률 {joint_hit*100:.1f}%). "
+                        "각 줄은 '그 줄만의 확률'이 가장 큰 결과이므로, 한 경기를 여러 줄로 걸 때는 위 '연결 추천'이나 복수 추천을 기준으로 고르세요.")
+            lines.append(conflict)
+        for p in pos:
+            cols["pred_summary"][p] = "\n".join(lines)
+            cols["pred_scen"][p] = scen
+            cols["pred_conflict"][p] = conflict
+    for c, v in cols.items():
+        res[c] = v
     return res
 
 
@@ -1636,7 +1857,7 @@ def build_predictions(df_all, target_df, hist=None, selfcal=None):
     for c in ("pred_dist", "pred_alt", "pred_draw", "pred_upset_txt", "pred_signal", "pred_upset", "pred_score_map"):
         if c not in res.columns:
             res[c] = None
-    return apply_history(res, hist if hist is not None else history_table(learn), selfcal)
+    return coherence_pass(apply_history(res, hist if hist is not None else history_table(learn), selfcal))
 
 
 # ───────────────────── 조합 추천 ─────────────────────

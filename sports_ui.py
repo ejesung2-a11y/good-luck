@@ -234,6 +234,17 @@ def _odds_txt(r):
     return txt
 
 
+def _scen_html(scen):
+    """가장 그럴듯한 스코어와, 그 스코어일 때 각 줄(일반·핸디·언더오버)의 결과"""
+    if not isinstance(scen, list) or not scen:
+        return ""
+    rows = "".join(f"<tr><td style='padding:2px 8px;font-weight:bold;color:#facc15;white-space:nowrap'>{html.escape(s['score'])}</td>"
+                   f"<td style='padding:2px 8px;white-space:nowrap'>{s['p']*100:.0f}%</td>"
+                   f"<td style='padding:2px 8px;color:#cbd5e1'>{html.escape(' · '.join(s['labs']))}</td></tr>" for s in scen)
+    return (f"<div style='font-size:11px;color:#94a3b8;margin-top:6px'>📊 시나리오 표 (한 경기의 모든 줄을 하나의 스코어 확률표로 맞춘 결과)</div>"
+            f"<div style='overflow-x:auto'><table style='font-size:12px;border-collapse:collapse'>{rows}</table></div>")
+
+
 def _card(g, notes=None):
     head = g.iloc[0]
     memo = (notes or {}).get(sports.game_key(head))
@@ -243,6 +254,10 @@ def _card(g, notes=None):
       <span style="font-size:10px;color:#64748b;margin-left:6px">📄 {html.escape(str(head.get('round_label', '')))}</span>
       <div style="font-size:16px;font-weight:bold;margin:6px 0">🏠 {html.escape(str(head['home_team']))} <span style="color:#64748b;font-size:12px">vs</span> ✈️ {html.escape(str(head['away_team']))}</div>"""
              + (f"<div style='font-size:12px;color:#fde68a'>📝 {html.escape(memo)}</div>" if memo else "")]
+    summ = head.get("pred_summary")
+    if _ok(summ):
+        parts.append("<div style='background:#0f172a;border:1px solid #475569;border-radius:8px;padding:8px 10px;margin:6px 0;font-size:12.5px;color:#e2e8f0'>"
+                     + html.escape(summ).replace(chr(10), "<br>").replace("   ·", "&nbsp;&nbsp;&nbsp;·") + _scen_html(head.get("pred_scen")) + "</div>")
     for _, r in g.iterrows():
         bt = r["bet_type"]
         tname = _tname(bt, r["line"])
@@ -250,6 +265,8 @@ def _card(g, notes=None):
         row = [f"<div style='border-top:1px solid #334155;padding-top:6px;margin-top:6px'><b>{tname}</b> · 배당 {_odds_txt(r)} → <b style='color:#facc15'>{html.escape(str(r['pred_pick']))}</b> ({prob}) {r['pred_label']} · 스코어 {html.escape(str(r['pred_score']))}</div>"]
         row.append(_bar(r.get("pred_dist")))
         chips = []
+        if _ok(r.get("pred_rec")): chips.append("🧭 " + r["pred_rec"])
+        if _ok(r.get("pred_link")): chips.append("🔗 " + r["pred_link"])
         if _ok(r.get("pred_alt")): chips.append(f"대안 {r['pred_alt']}")
         for k_ in ("pred_draw", "pred_upset_txt", "pred_signal"):
             if _ok(r.get(k_)): chips.append(r[k_])
